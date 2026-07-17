@@ -36,3 +36,50 @@ bash auth-service.sh --debug
 远端来源暂时断开时，本地认证服务继续使用上一份完整有效快照。恢复连接后会自动同步，不需要重启。
 
 配置错误会指出缺少或非法的配置名，不输出 traceback。按提示检查 [注册配置](registration.md#配置邮箱) 或 [认证同步配置](auth-service.md#配置远端同步)。
+
+## Config fetch failed
+
+启动阶段要从 `https://accounts.x.ai/sign-up` 抓取 `SITE_KEY` / `ACTION_ID` / `STATE_TREE`。任一缺失即报：
+
+```text
+RuntimeError: Config fetch failed
+```
+
+这不是邮箱模式错误，也不是安装失败。常见原因：
+
+1. 机房 IP 被 Cloudflare 拦，注册页返回挑战页/空壳，解析失败
+2. 未配置出口代理：`REGISTER_PROXY` 为空直连
+3. 未启用清障：`CLEARANCE_ENABLED=0`，FlareSolverr 未起
+4. 页面结构变化导致正则未命中（较少见）
+
+排查：
+
+```bash
+bash start.sh --debug
+# 看是否拿到 SITE_KEY / ACTION_ID / STATE_TREE，以及 RegisterProxy 值
+
+# 本机能否打开注册页
+curl -sS -I --max-time 20 https://accounts.x.ai/sign-up | head
+
+# 推荐：先起 clearance 栈，再写代理
+cd clearance && docker compose up -d
+```
+
+`.env` 示例：
+
+```env
+EMAIL_MODE=tempmail
+REGISTER_PROXY=http://127.0.0.1:40080
+CLEARANCE_ENABLED=1
+FLARESOLVERR_URL=http://127.0.0.1:8191
+CLEARANCE_PROXY=http://privoxy:8118
+CLEARANCE_URLS=https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai
+```
+
+然后再：
+
+```bash
+bash start.sh --debug
+```
+
+[PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md

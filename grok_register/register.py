@@ -877,7 +877,25 @@ async def fetch_config():
         finally:
             await _close_browser_hard(browser, timeout=5.0)
     if not all([SITE_KEY, ACTION_ID, STATE_TREE]):
-        raise RuntimeError("Config fetch failed")
+        missing = [
+            name
+            for name, value in (
+                ("SITE_KEY", SITE_KEY),
+                ("ACTION_ID", ACTION_ID),
+                ("STATE_TREE", STATE_TREE),
+            )
+            if not value
+        ]
+        proxy = register_proxy_url() or "(direct)"
+        raise RuntimeError(
+            "Config fetch failed: missing "
+            + ", ".join(missing)
+            + f"; url={SITE_URL}/sign-up proxy={proxy}. "
+            "Usually CF/network blocks signup page scrape. "
+            "Try: bash start.sh --debug; set REGISTER_PROXY; "
+            "enable CLEARANCE_ENABLED=1 + FlareSolverr; "
+            "or verify CloakBrowser can open accounts.x.ai."
+        )
 
 
 # ──────────────────────────────────────────────
