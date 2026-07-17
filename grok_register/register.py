@@ -845,8 +845,14 @@ async def fetch_config():
         browser = await pw.chromium.launch(**_launch_options())
         try:
             page = await _prepare_browser_page(browser)
-            await page.goto(f'{SITE_URL}/sign-up?redirect=grok-com', timeout=30000)
-            await page.wait_for_timeout(5000)
+            # Prefer domcontentloaded: CF/xAI signup often never reaches full 'load'.
+            config_goto_timeout_ms = int(os.environ.get("CONFIG_GOTO_TIMEOUT_MS", "60000") or "60000")
+            await page.goto(
+                f'{SITE_URL}/sign-up?redirect=grok-com',
+                timeout=config_goto_timeout_ms,
+                wait_until=PAGE_GOTO_WAIT_UNTIL,
+            )
+            await page.wait_for_timeout(int(os.environ.get("CONFIG_GOTO_SETTLE_MS", "5000") or "5000"))
             html = await page.content()
             m = re.search(r'0x4AAAAAAA[a-zA-Z0-9_-]+', html)
             if m: SITE_KEY = m.group(0); debug_log(f'[+] SITE_KEY: {SITE_KEY}')
