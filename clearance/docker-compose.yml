@@ -1,0 +1,83 @@
+# Standalone CF clearance stack for grok-free-register.
+# No app dependency — only WARP (SOCKS5) + Privoxy (HTTP) + FlareSolverr.
+#
+#   cd clearance && docker compose up -d
+#
+# Host ports (loopback only):
+#   127.0.0.1:40000  → WARP SOCKS5
+#   127.0.0.1:40080  → Privoxy HTTP (→ WARP)
+#   127.0.0.1:8191   → FlareSolverr
+#
+# Wire into project root .env:
+#   REGISTER_PROXY=http://127.0.0.1:40080
+#   CLEARANCE_ENABLED=1
+#   FLARESOLVERR_URL=http://127.0.0.1:8191
+#   CLEARANCE_PROXY=http://privoxy:8118
+#   CLEARANCE_URLS=https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai
+#
+# Do not run this stack and another compose that binds the same host ports
+# at the same time (any other WARP/FS stack already on 40000/40080/8191).
+
+services:
+  warp-proxy:
+    image: caomingjun/warp:latest
+    container_name: grok-clearance-warp
+    restart: unless-stopped
+    environment:
+      WARP_SLEEP: "2"
+      # Optional Cloudflare WARP+ license
+      # WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 0
+      net.ipv4.conf.all.src_valid_mark: 1
+    ports:
+      - "127.0.0.1:${WARP_SOCKS_PORT:-40000}:1080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1', 1080), 5); s.close()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  privoxy:
+    image: vimagick/privoxy:latest
+    container_name: grok-clearance-privoxy
+    restart: unless-stopped
+    depends_on:
+      warp-proxy:
+        condition: service_started
+    volumes:
+      - ./privoxy-warp.conf:/etc/privoxy/config:ro
+    ports:
+      - "127.0.0.1:${PRIVOXY_PORT:-40080}:8118"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8118 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: grok-clearance-flaresolverr
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${FLARESOLVERR_LOG_LEVEL:-info}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:${FLARESOLVERR_PORT:-8191}:8191"
+    # Proxy for minting is NOT set here — grok_register/clearance.py
+    # passes CLEARANCE_PROXY per request (e.g. http://privoxy:8118) so
+    # FS browser egress matches REGISTER_PROXY on the host.
+    depends_on:
+      privoxy:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8191/ >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s

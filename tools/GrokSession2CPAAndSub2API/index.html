@@ -1,0 +1,902 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Grok Session → CPA / sub2api</title>
+    <meta name="theme-color" content="#111827" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0b1220;
+        --surface: #121a2b;
+        --surface-soft: #1a2438;
+        --line: #2a3650;
+        --text: #e8eefc;
+        --muted: #93a0bc;
+        --accent: #38bdf8;
+        --accent-strong: #0ea5e9;
+        --success: #34d399;
+        --danger: #f87171;
+        --warning: #fbbf24;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        --sans: "Inter", "Avenir Next", "Helvetica Neue", "PingFang SC", "Noto Sans SC", sans-serif;
+        --radius: 10px;
+        --shadow: 0 18px 50px rgba(0, 0, 0, 0.35);
+      }
+      * { box-sizing: border-box; }
+      html, body { min-height: 100%; margin: 0; }
+      body {
+        font-family: var(--sans);
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(56, 189, 248, 0.12), transparent 28%),
+          linear-gradient(180deg, #0b1220, #0a101b 40%, #070b14);
+      }
+      button, textarea, input { font: inherit; }
+      button { border: 0; cursor: pointer; }
+      .app { width: min(1280px, calc(100vw - 28px)); margin: 0 auto; padding: 22px 0 36px; }
+      .topbar { display: flex; justify-content: space-between; gap: 16px; align-items: flex-end; margin-bottom: 16px; }
+      .eyebrow { margin: 0 0 8px; color: var(--accent); font-size: 0.78rem; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; }
+      h1 { margin: 0; font-size: clamp(1.5rem, 3vw, 2.3rem); line-height: 1.1; }
+      .subtitle { margin: 10px 0 0; color: var(--muted); line-height: 1.5; max-width: 70ch; }
+      .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+      .chip {
+        display: inline-flex; align-items: center; min-height: 32px; padding: 6px 10px;
+        border: 1px solid var(--line); border-radius: 999px; background: rgba(18, 26, 43, 0.9); color: var(--muted); font-size: 0.84rem;
+      }
+      .toolbar { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+      .segmented {
+        display: inline-grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px;
+        width: min(760px, 100%); padding: 4px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface);
+      }
+      .segmented button {
+        min-height: 40px; border-radius: 8px; background: transparent; color: var(--muted); padding: 0 10px;
+      }
+      .segmented button[aria-pressed="true"] { background: var(--accent-strong); color: #041018; font-weight: 800; }
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      .button {
+        display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 0 14px;
+        border-radius: var(--radius); transition: 0.15s ease;
+      }
+      .button-primary { background: var(--accent-strong); color: #041018; font-weight: 800; }
+      .button-primary:hover { filter: brightness(1.08); }
+      .button-secondary { border: 1px solid var(--line); background: var(--surface); color: var(--text); }
+      .button-secondary:hover { background: var(--surface-soft); }
+      .button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+      .panel {
+        min-width: 0; border: 1px solid var(--line); border-radius: var(--radius);
+        background: rgba(18, 26, 43, 0.92); box-shadow: var(--shadow);
+      }
+      .panel-head { display: flex; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+      .panel-head h2 { margin: 0; font-size: 1rem; }
+      .panel-head p { margin: 4px 0 0; color: var(--muted); font-size: 0.88rem; line-height: 1.45; }
+      .panel-body { padding: 14px 16px 16px; }
+      .guide {
+        margin: 0 0 12px; padding: 12px 14px; border: 1px solid rgba(56, 189, 248, 0.28);
+        border-left: 4px solid var(--accent); border-radius: var(--radius); background: rgba(14, 165, 233, 0.08);
+        color: var(--muted); line-height: 1.5; font-size: 0.9rem;
+      }
+      .guide strong { color: var(--text); }
+      .guide code { font-family: var(--mono); color: var(--accent); }
+      textarea {
+        width: 100%; min-height: 460px; resize: vertical; border: 1px solid var(--line); border-radius: var(--radius);
+        padding: 12px; background: #0a1220; color: var(--text); font-family: var(--mono); font-size: 0.82rem; line-height: 1.5;
+      }
+      textarea:focus { outline: 2px solid rgba(56, 189, 248, 0.35); border-color: var(--accent); }
+      .status-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+      .status {
+        min-height: 30px; display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px;
+        border: 1px solid var(--line); color: var(--muted); font-size: 0.84rem; background: rgba(0,0,0,0.15);
+      }
+      .status.ok { color: var(--success); border-color: rgba(52, 211, 153, 0.35); }
+      .status.err { color: var(--danger); border-color: rgba(248, 113, 113, 0.35); }
+      .status.warn { color: var(--warning); border-color: rgba(251, 191, 36, 0.35); }
+      .accounts, .issues {
+        margin-top: 12px; display: grid; gap: 8px; max-height: 180px; overflow: auto;
+      }
+      .card {
+        border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: rgba(0,0,0,0.14);
+        font-size: 0.86rem; line-height: 1.4;
+      }
+      .card .title { font-weight: 700; }
+      .card .meta { color: var(--muted); margin-top: 4px; font-family: var(--mono); font-size: 0.78rem; word-break: break-all; }
+      .drop-active textarea { border-color: var(--accent); box-shadow: inset 0 0 0 1px rgba(56,189,248,0.35); }
+      .footer-note { margin-top: 14px; color: var(--muted); font-size: 0.84rem; line-height: 1.5; }
+      @media (max-width: 960px) {
+        .workspace { grid-template-columns: 1fr; }
+        .segmented { grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+        .topbar { flex-direction: column; align-items: flex-start; }
+        .chips { justify-content: flex-start; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <div class="topbar">
+        <div>
+          <p class="eyebrow">Grok Free Register toolkit</p>
+          <h1>Grok Session → CPA / sub2api</h1>
+          <p class="subtitle">
+            纯前端转换：把注册机 <code>xai-*.json</code> / SSO / accounts / sessions
+            转成 CPA、sub2api 导入包、batch 建号、或 sso-to-oauth 请求体。本地解析，不上传。
+          </p>
+        </div>
+        <div class="chips">
+          <span class="chip">platform: grok</span>
+          <span class="chip">base: cli-chat-proxy</span>
+          <span class="chip">有 refresh 不写账号 6h 死期</span>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="segmented" role="tablist" aria-label="输出格式">
+          <button type="button" data-format="cpa" aria-pressed="true">CPA</button>
+          <button type="button" data-format="sub2api" aria-pressed="false">sub2api 导入</button>
+          <button type="button" data-format="batch" aria-pressed="false">batch 建号</button>
+          <button type="button" data-format="sso" aria-pressed="false">sso-to-oauth</button>
+        </div>
+        <div class="actions">
+          <button class="button button-secondary" id="btn-sample" type="button">填示例</button>
+          <button class="button button-secondary" id="btn-clear" type="button">清空</button>
+          <button class="button button-secondary" id="btn-copy" type="button" disabled>复制输出</button>
+          <button class="button button-primary" id="btn-download" type="button" disabled>下载 JSON</button>
+        </div>
+      </div>
+
+      <div class="workspace">
+        <section class="panel" id="input-panel">
+          <div class="panel-head">
+            <div>
+              <h2>输入</h2>
+              <p>粘贴 / 拖入 JSON、JSON 数组、jsonl、accounts 行、纯 SSO 行</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="guide">
+              <strong>支持输入</strong><br />
+              1. <code>authenticated/xai-*.json</code> 或 <code>cpa_ready/xai-*.json</code><br />
+              2. sub2api account / accounts 数组 / sub2api-data 包<br />
+              3. <code>auth-sessions.jsonl</code>（email + cookies.sso）<br />
+              4. <code>accounts.txt</code>：<code>email:password:sso</code><br />
+              5. <code>grok.txt</code>：每行一个 SSO JWT
+            </div>
+            <textarea id="session-input" spellcheck="false" placeholder="在此粘贴 xai-*.json / SSO / accounts 行…"></textarea>
+            <div class="status-row">
+              <span class="status" id="input-status">等待输入</span>
+              <span class="status" id="convert-status">未转换</span>
+            </div>
+            <div class="accounts" id="accounts"></div>
+            <div class="issues" id="issues"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>输出</h2>
+              <p id="output-help">CPA：type=xai，对齐注册机 cpa_ready / new-api 风格</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <textarea id="output" readonly spellcheck="false" placeholder="转换结果会显示在这里"></textarea>
+            <div class="status-row">
+              <span class="status" id="output-status">空</span>
+            </div>
+            <p class="footer-note">
+              规则：<br />
+              • free 号 <code>base_url</code> 固定为 <code>https://cli-chat-proxy.grok.com/v1</code>（忽略 authenticated 里的 api.x.ai）<br />
+              • 有 <code>refresh_token</code> 时：sub2api 账号<strong>不写</strong>顶层 <code>expires_at/auto_pause</code>，避免 6h 被 pause<br />
+              • 无 refresh 时：写 access 的 exp + auto_pause，到期停用<br />
+              • 纯 SSO 输入只能出 <code>sso-to-oauth</code> 请求体；CPA/sub2api 需要 OAuth token
+            </p>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <script>
+      (() => {
+        const CLI_BASE = "https://cli-chat-proxy.grok.com/v1";
+        const TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
+        const HELP = {
+          cpa: "CPA：type=xai，对齐注册机 cpa_ready / cli-proxy 风格",
+          sub2api: "sub2api 数据导入：type=sub2api-data / accounts[] platform=grok",
+          batch: "batch 建号：POST /api/v1/admin/accounts/batch 的 {accounts:[]}",
+          sso: "sso-to-oauth：POST /api/v1/admin/grok/sso-to-oauth 的 {sso_tokens:[]}",
+        };
+
+        const els = {
+          input: document.querySelector("#session-input"),
+          output: document.querySelector("#output"),
+          inputStatus: document.querySelector("#input-status"),
+          convertStatus: document.querySelector("#convert-status"),
+          outputStatus: document.querySelector("#output-status"),
+          accounts: document.querySelector("#accounts"),
+          issues: document.querySelector("#issues"),
+          outputHelp: document.querySelector("#output-help"),
+          inputPanel: document.querySelector("#input-panel"),
+          btnCopy: document.querySelector("#btn-copy"),
+          btnDownload: document.querySelector("#btn-download"),
+          btnClear: document.querySelector("#btn-clear"),
+          btnSample: document.querySelector("#btn-sample"),
+          formatButtons: [...document.querySelectorAll("[data-format]")],
+        };
+
+        const state = {
+          format: "cpa",
+          converted: [],
+          ssoTokens: [],
+          skipped: [],
+          timer: null,
+          outputText: "",
+        };
+
+        function isPlainObject(value) {
+          return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+        }
+
+        function firstNonEmpty(...values) {
+          for (const value of values) {
+            if (value === undefined || value === null) continue;
+            if (typeof value === "string" && value.trim() === "") continue;
+            return typeof value === "string" ? value.trim() : value;
+          }
+          return undefined;
+        }
+
+        function setStatus(el, text, tone = "") {
+          el.textContent = text;
+          el.className = "status" + (tone ? ` ${tone}` : "");
+        }
+
+        function decodeBase64Url(value) {
+          const normalized = String(value).replace(/-/g, "+").replace(/_/g, "/");
+          const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+          try {
+            return decodeURIComponent(
+              Array.from(atob(padded), (c) => `%${c.charCodeAt(0).toString(16).padStart(2, "0")}`).join("")
+            );
+          } catch {
+            return null;
+          }
+        }
+
+        function parseJwtPayload(token) {
+          if (!token || typeof token !== "string" || token.split(".").length < 2) return null;
+          try {
+            const raw = decodeBase64Url(token.split(".")[1]);
+            return raw ? JSON.parse(raw) : null;
+          } catch {
+            return null;
+          }
+        }
+
+        function looksLikeJwt(value) {
+          return typeof value === "string" && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value.trim());
+        }
+
+        function normalizeTimestamp(value) {
+          if (value === undefined || value === null || value === "") return undefined;
+          if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().replace(/\.\d{3}Z$/, "Z");
+          if (typeof value === "number" && Number.isFinite(value)) {
+            const ms = value > 1e12 ? value : value * 1000;
+            return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+          }
+          if (typeof value === "string") {
+            const n = Number(value);
+            if (Number.isFinite(n) && /^\d+(\.\d+)?$/.test(value.trim())) {
+              const ms = n > 1e12 ? n : n * 1000;
+              return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+            }
+            const d = new Date(value);
+            if (!Number.isNaN(d.getTime())) return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+          }
+          return undefined;
+        }
+
+        function unixSecondsFromValue(value) {
+          if (value === undefined || value === null || value === "") return undefined;
+          if (typeof value === "number" && Number.isFinite(value)) return Math.floor(value > 1e12 ? value / 1000 : value);
+          if (typeof value === "string") {
+            const n = Number(value);
+            if (Number.isFinite(n) && /^\d+(\.\d+)?$/.test(value.trim())) return Math.floor(n > 1e12 ? n / 1000 : n);
+            const d = new Date(value);
+            if (!Number.isNaN(d.getTime())) return Math.floor(d.getTime() / 1000);
+          }
+          return undefined;
+        }
+
+        function stripUndefined(obj) {
+          if (Array.isArray(obj)) return obj.map(stripUndefined).filter((v) => v !== undefined);
+          if (!isPlainObject(obj)) return obj;
+          const out = {};
+          for (const [k, v] of Object.entries(obj)) {
+            if (v === undefined || v === null || v === "") continue;
+            const next = stripUndefined(v);
+            if (next === undefined) continue;
+            if (isPlainObject(next) && !Object.keys(next).length) continue;
+            out[k] = next;
+          }
+          return out;
+        }
+
+        function extractSsoFromCookies(cookies) {
+          if (!Array.isArray(cookies)) return undefined;
+          let sso = "";
+          let fallback = "";
+          for (const cookie of cookies) {
+            if (!isPlainObject(cookie)) continue;
+            const name = String(cookie.name || "");
+            const value = String(cookie.value || "").trim();
+            if (!value) continue;
+            if (name === "sso" && !sso) sso = value;
+            if (name === "sso-rw" && !fallback) fallback = value;
+          }
+          return sso || fallback || undefined;
+        }
+
+        function collectOAuthLikeObjects(value, sourceName = "pasted-json") {
+          const found = [];
+          const visited = new WeakSet();
+          function visit(item, path) {
+            if (!isPlainObject(item) && !Array.isArray(item)) return;
+            if (Array.isArray(item)) {
+              item.forEach((child, i) => visit(child, `${path}[${i}]`));
+              return;
+            }
+            if (visited.has(item)) return;
+            visited.add(item);
+
+            const access = firstNonEmpty(
+              item.access_token, item.accessToken,
+              item.tokens?.access_token, item.tokens?.accessToken,
+              item.credentials?.access_token, item.credentials?.accessToken,
+            );
+            const refresh = firstNonEmpty(
+              item.refresh_token, item.refreshToken,
+              item.tokens?.refresh_token, item.tokens?.refreshToken,
+              item.credentials?.refresh_token, item.credentials?.refreshToken,
+            );
+            const idToken = firstNonEmpty(
+              item.id_token, item.idToken,
+              item.tokens?.id_token, item.tokens?.idToken,
+              item.credentials?.id_token, item.credentials?.idToken,
+            );
+            const email = firstNonEmpty(item.email, item.user?.email, item.credentials?.email, item.name);
+            const sub = firstNonEmpty(item.sub, item.credentials?.sub, item.subject);
+            const sso = firstNonEmpty(item.sso, item.sso_token, item.ssoToken, extractSsoFromCookies(item.cookies));
+            const isXai = item.type === "xai" || item.auth_kind === "oauth" || item.platform === "grok";
+            const isSub2 = item.platform === "grok" && item.credentials;
+
+            if (access || (refresh && (email || sub || isXai || isSub2)) || (sso && (email || item.cookies))) {
+              found.push({ value: item, sourceName, path, kind: access || refresh ? "oauth" : "sso" });
+              return;
+            }
+
+            // sub2api-data envelope
+            if (Array.isArray(item.accounts)) {
+              visit(item.accounts, `${path}.accounts`);
+              return;
+            }
+
+            for (const [key, child] of Object.entries(item)) {
+              if (["access_token", "accessToken", "refresh_token", "id_token", "cookies"].includes(key)) continue;
+              visit(child, `${path}.${key}`);
+            }
+          }
+          visit(value, "$");
+          return found;
+        }
+
+        function parseTextInput(text) {
+          const raw = String(text || "").trim();
+          if (!raw) return { oauthSources: [], ssoTokens: [], skipped: [] };
+
+          // Try full JSON first
+          try {
+            const parsed = JSON.parse(raw);
+            const oauthSources = collectOAuthLikeObjects(parsed);
+            const ssoTokens = [];
+            // also collect pure sso fields if any
+            for (const src of oauthSources) {
+              if (src.kind === "sso") {
+                const sso = firstNonEmpty(src.value.sso, src.value.sso_token, extractSsoFromCookies(src.value.cookies));
+                if (sso) ssoTokens.push({ token: sso, email: firstNonEmpty(src.value.email, src.value.user?.email), path: src.path });
+              }
+            }
+            if (oauthSources.length || ssoTokens.length) {
+              return { oauthSources: oauthSources.filter((s) => s.kind === "oauth"), ssoTokens, skipped: [] };
+            }
+          } catch {
+            // line mode below
+          }
+
+          const oauthSources = [];
+          const ssoTokens = [];
+          const skipped = [];
+          const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+          lines.forEach((line, index) => {
+            // jsonl
+            if (line.startsWith("{") || line.startsWith("[")) {
+              try {
+                const parsed = JSON.parse(line);
+                const found = collectOAuthLikeObjects(parsed, `line-${index + 1}`);
+                for (const src of found) {
+                  if (src.kind === "oauth") oauthSources.push(src);
+                  else {
+                    const sso = firstNonEmpty(src.value.sso, src.value.sso_token, extractSsoFromCookies(src.value.cookies));
+                    if (sso) ssoTokens.push({ token: sso, email: firstNonEmpty(src.value.email), path: src.path });
+                  }
+                }
+                if (!found.length) skipped.push({ path: `line-${index + 1}`, reason: "JSON 行未识别为 Grok 凭证" });
+                return;
+              } catch (error) {
+                skipped.push({ path: `line-${index + 1}`, reason: `JSON 行解析失败：${error.message}` });
+                return;
+              }
+            }
+
+            // accounts.txt: email:password:sso
+            if (line.includes(":") && !looksLikeJwt(line)) {
+              const parts = line.split(":");
+              if (parts.length >= 3) {
+                const email = parts[0];
+                const sso = parts.slice(2).join(":");
+                if (looksLikeJwt(sso)) {
+                  ssoTokens.push({ token: sso.trim(), email: email.trim(), path: `accounts:${index + 1}` });
+                  return;
+                }
+              }
+            }
+
+            // pure SSO jwt line
+            if (looksLikeJwt(line)) {
+              ssoTokens.push({ token: line.trim(), path: `sso:${index + 1}` });
+              return;
+            }
+
+            skipped.push({ path: `line-${index + 1}`, reason: "无法识别该行" });
+          });
+
+          return { oauthSources, ssoTokens, skipped };
+        }
+
+        function convertOAuthRecord(record, options = {}) {
+          if (!isPlainObject(record)) throw new Error("记录不是对象");
+
+          // unwrap sub2api account
+          const credsIn = isPlainObject(record.credentials) ? record.credentials : {};
+          const accessToken = firstNonEmpty(
+            record.access_token, record.accessToken,
+            credsIn.access_token, credsIn.accessToken,
+            record.tokens?.access_token,
+          );
+          if (!accessToken) throw new Error("缺少 access_token");
+
+          const refreshToken = firstNonEmpty(
+            record.refresh_token, record.refreshToken,
+            credsIn.refresh_token, credsIn.refreshToken,
+            record.tokens?.refresh_token,
+          );
+          const idToken = firstNonEmpty(
+            record.id_token, record.idToken,
+            credsIn.id_token, credsIn.idToken,
+            record.tokens?.id_token,
+          );
+          const tokenType = firstNonEmpty(record.token_type, credsIn.token_type, "Bearer");
+          const accessClaims = parseJwtPayload(accessToken) || {};
+          const idClaims = parseJwtPayload(idToken) || {};
+
+          const email = firstNonEmpty(
+            record.email, credsIn.email, record.user?.email, record.name,
+            idClaims.email, accessClaims.email, accessClaims.preferred_username,
+          );
+          const sub = firstNonEmpty(
+            record.sub, credsIn.sub, record.subject,
+            idClaims.sub, accessClaims.sub, accessClaims.principal_id,
+          );
+
+          const expiresIn = firstNonEmpty(
+            record.expires_in, credsIn.expires_in,
+            accessClaims.exp && accessClaims.iat ? Number(accessClaims.exp) - Number(accessClaims.iat) : undefined,
+            21600,
+          );
+
+          const expiredIso = firstNonEmpty(
+            normalizeTimestamp(record.expired),
+            normalizeTimestamp(record.expires_at),
+            normalizeTimestamp(credsIn.expires_at),
+            normalizeTimestamp(record.expiresAt),
+            accessClaims.exp ? normalizeTimestamp(accessClaims.exp) : undefined,
+          );
+          const expiresUnix = firstNonEmpty(
+            unixSecondsFromValue(expiredIso),
+            unixSecondsFromValue(accessClaims.exp),
+          );
+
+          const lastRefresh = firstNonEmpty(
+            normalizeTimestamp(record.last_refresh),
+            normalizeTimestamp(credsIn.last_refresh),
+            normalizeTimestamp(options.now || new Date()),
+          );
+
+          const baseUrl = CLI_BASE; // free CLI 强制
+          const hasRefresh = Boolean(refreshToken);
+          const name = firstNonEmpty(email, sub && `grok-${String(sub).slice(0, 8)}`, options.sourceName, "Grok Account");
+
+          const headers = isPlainObject(record.headers) ? record.headers : {
+            "x-grok-client-version": "0.2.93",
+            "x-xai-token-auth": "xai-grok-cli",
+            "X-XAI-Token-Auth": "xai-grok-cli",
+            "x-authenticateresponse": "authenticate-response",
+            "x-grok-client-identifier": "grok-shell",
+            "x-compaction-at": "400000",
+            "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
+          };
+
+          const cpa = stripUndefined({
+            type: "xai",
+            access_token: accessToken,
+            refresh_token: refreshToken,
+            id_token: idToken,
+            token_type: tokenType,
+            expires_in: Number(expiresIn) || undefined,
+            expired: expiredIso,
+            last_refresh: lastRefresh,
+            sub,
+            base_url: baseUrl,
+            token_endpoint: firstNonEmpty(record.token_endpoint, TOKEN_ENDPOINT),
+            auth_kind: "oauth",
+            headers,
+            email,
+          });
+
+          // sub2api credentials always keep token-level expires_at
+          const credentials = stripUndefined({
+            access_token: accessToken,
+            refresh_token: refreshToken,
+            id_token: idToken,
+            token_type: tokenType,
+            expires_at: expiredIso,
+            email,
+            sub,
+            base_url: baseUrl,
+          });
+
+          // 有 refresh：不写账号级 expires_at，避免 6h auto-pause
+          // 无 refresh：写 access exp + auto_pause
+          const sub2apiAccount = stripUndefined({
+            name,
+            platform: "grok",
+            type: "oauth",
+            credentials,
+            concurrency: Number.isFinite(Number(record.concurrency)) ? Number(record.concurrency) : 1,
+            priority: Number.isFinite(Number(record.priority)) ? Number(record.priority) : 0,
+            expires_at: hasRefresh ? undefined : expiresUnix,
+            auto_pause_on_expired: hasRefresh ? undefined : (expiresUnix ? true : undefined),
+            notes: firstNonEmpty(record.notes, record.note, record.remark),
+          });
+
+          return {
+            sourceName: options.sourceName,
+            sourcePath: options.sourcePath,
+            email,
+            name,
+            sub,
+            hasRefresh,
+            expiresAt: expiredIso,
+            expiresUnix,
+            cpa,
+            sub2apiAccount,
+          };
+        }
+
+        function convertFromText(text) {
+          const { oauthSources, ssoTokens, skipped } = parseTextInput(text);
+          const converted = [];
+          const allSkipped = [...skipped];
+          const now = new Date();
+
+          oauthSources.forEach((item, index) => {
+            try {
+              converted.push(convertOAuthRecord(item.value, {
+                now,
+                sourceName: item.sourceName,
+                sourcePath: item.path || `$[${index}]`,
+              }));
+            } catch (error) {
+              allSkipped.push({
+                path: item.path || `$[${index}]`,
+                reason: error instanceof Error ? error.message : "无法转换",
+              });
+            }
+          });
+
+          // de-dupe sso
+          const seenSso = new Set();
+          const uniqueSso = [];
+          for (const item of ssoTokens) {
+            const token = String(item.token || "").trim();
+            if (!token || seenSso.has(token)) continue;
+            seenSso.add(token);
+            uniqueSso.push(item);
+          }
+
+          if (!converted.length && !uniqueSso.length) {
+            allSkipped.push({ path: "$", reason: "未找到可识别的 Grok OAuth / SSO 记录" });
+          }
+
+          return { converted, ssoTokens: uniqueSso, skipped: allSkipped };
+        }
+
+        function buildSub2apiDocument(converted, now = new Date()) {
+          return {
+            type: "sub2api-data",
+            version: 1,
+            exported_at: normalizeTimestamp(now),
+            proxies: [],
+            accounts: converted.map((item) => item.sub2apiAccount),
+          };
+        }
+
+        function buildBatchDocument(converted) {
+          return { accounts: converted.map((item) => item.sub2apiAccount) };
+        }
+
+        function buildSsoDocument(ssoTokens) {
+          return {
+            sso_tokens: ssoTokens.map((item) => item.token),
+            // 便于对照；API 实际只吃 sso_tokens
+            _meta: ssoTokens.map((item, i) => stripUndefined({
+              index: i + 1,
+              email: item.email,
+              path: item.path,
+              token_head: String(item.token).slice(0, 24) + "...",
+            })),
+          };
+        }
+
+        function buildCpaDocument(converted) {
+          return converted.length === 1
+            ? converted[0].cpa
+            : converted.map((item) => item.cpa);
+        }
+
+        function buildOutputDocument() {
+          const now = new Date();
+          if (state.format === "cpa") {
+            if (!state.converted.length) throw new Error("CPA 需要 OAuth 凭证（access_token）。纯 SSO 请切换到 sso-to-oauth");
+            return buildCpaDocument(state.converted);
+          }
+          if (state.format === "sub2api") {
+            if (!state.converted.length) throw new Error("sub2api 导入需要 OAuth 凭证。纯 SSO 请切换到 sso-to-oauth");
+            return buildSub2apiDocument(state.converted, now);
+          }
+          if (state.format === "batch") {
+            if (!state.converted.length) throw new Error("batch 建号需要 OAuth 凭证。纯 SSO 请切换到 sso-to-oauth");
+            return buildBatchDocument(state.converted);
+          }
+          if (state.format === "sso") {
+            if (!state.ssoTokens.length) {
+              // also allow extracting nothing useful message
+              throw new Error("未找到 SSO token。可粘贴 grok.txt / accounts.txt / auth-sessions.jsonl");
+            }
+            return buildSsoDocument(state.ssoTokens);
+          }
+          return buildSub2apiDocument(state.converted, now);
+        }
+
+        function renderAccounts() {
+          if (!state.converted.length && !state.ssoTokens.length) {
+            els.accounts.innerHTML = "";
+            return;
+          }
+          const oauthCards = state.converted.map((item) => `
+            <div class="card">
+              <div class="title">${escapeHtml(item.name || item.email || "Grok Account")}</div>
+              <div class="meta">
+                email=${escapeHtml(item.email || "-")}
+                · sub=${escapeHtml(item.sub || "-")}
+                · refresh=${item.hasRefresh ? "yes" : "no"}
+                · exp=${escapeHtml(item.expiresAt || "-")}
+              </div>
+            </div>
+          `).join("");
+          const ssoCards = state.ssoTokens.slice(0, 20).map((item, i) => `
+            <div class="card">
+              <div class="title">SSO #${i + 1}${item.email ? " · " + escapeHtml(item.email) : ""}</div>
+              <div class="meta">${escapeHtml(String(item.token).slice(0, 48))}...</div>
+            </div>
+          `).join("");
+          els.accounts.innerHTML = oauthCards + ssoCards;
+        }
+
+        function renderIssues() {
+          if (!state.skipped.length) {
+            els.issues.innerHTML = "";
+            return;
+          }
+          els.issues.innerHTML = state.skipped.map((item) => `
+            <div class="card">
+              <div class="title">跳过 ${escapeHtml(item.path || "?")}</div>
+              <div class="meta">${escapeHtml(item.reason || "")}</div>
+            </div>
+          `).join("");
+        }
+
+        function escapeHtml(value) {
+          return String(value ?? "")
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;");
+        }
+
+        function updateOutput() {
+          els.outputHelp.textContent = HELP[state.format] || "";
+          try {
+            if (!els.input.value.trim()) {
+              state.outputText = "";
+              els.output.value = "";
+              els.btnCopy.disabled = true;
+              els.btnDownload.disabled = true;
+              setStatus(els.outputStatus, "空");
+              setStatus(els.convertStatus, "未转换");
+              return;
+            }
+            const doc = buildOutputDocument();
+            state.outputText = JSON.stringify(doc, null, 2);
+            els.output.value = state.outputText;
+            els.btnCopy.disabled = false;
+            els.btnDownload.disabled = false;
+            const count = state.format === "sso" ? state.ssoTokens.length : state.converted.length;
+            setStatus(els.outputStatus, `已生成 · ${count} 条`, "ok");
+            setStatus(els.convertStatus, `OAuth ${state.converted.length} / SSO ${state.ssoTokens.length}`, "ok");
+          } catch (error) {
+            state.outputText = "";
+            els.output.value = "";
+            els.btnCopy.disabled = true;
+            els.btnDownload.disabled = true;
+            setStatus(els.outputStatus, error instanceof Error ? error.message : "生成失败", "err");
+            setStatus(els.convertStatus, `OAuth ${state.converted.length} / SSO ${state.ssoTokens.length}`, state.converted.length || state.ssoTokens.length ? "warn" : "err");
+          }
+        }
+
+        function scheduleConvert() {
+          clearTimeout(state.timer);
+          state.timer = setTimeout(() => {
+            try {
+              const result = convertFromText(els.input.value);
+              state.converted = result.converted;
+              state.ssoTokens = result.ssoTokens;
+              state.skipped = result.skipped;
+              const total = state.converted.length + state.ssoTokens.length;
+              setStatus(
+                els.inputStatus,
+                total ? `识别 OAuth ${state.converted.length} · SSO ${state.ssoTokens.length}` : "未识别到凭证",
+                total ? "ok" : "warn",
+              );
+              renderAccounts();
+              renderIssues();
+              updateOutput();
+            } catch (error) {
+              state.converted = [];
+              state.ssoTokens = [];
+              state.skipped = [{ path: "$", reason: error instanceof Error ? error.message : "转换失败" }];
+              setStatus(els.inputStatus, error instanceof Error ? error.message : "转换失败", "err");
+              renderAccounts();
+              renderIssues();
+              updateOutput();
+            }
+          }, 120);
+        }
+
+        function downloadOutput() {
+          if (!state.outputText) return;
+          const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+          const name = `grok-${state.format}-${stamp}.json`;
+          const blob = new Blob([state.outputText], { type: "application/json;charset=utf-8" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = name;
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+
+        async function copyOutput() {
+          if (!state.outputText) return;
+          try {
+            await navigator.clipboard.writeText(state.outputText);
+            setStatus(els.outputStatus, "已复制", "ok");
+          } catch {
+            els.output.select();
+            document.execCommand("copy");
+            setStatus(els.outputStatus, "已复制", "ok");
+          }
+        }
+
+        function setFormat(format) {
+          state.format = format;
+          els.formatButtons.forEach((btn) => {
+            btn.setAttribute("aria-pressed", btn.dataset.format === format ? "true" : "false");
+          });
+          updateOutput();
+        }
+
+        function fillSample() {
+          const now = Math.floor(Date.now() / 1000);
+          const exp = now + 21600;
+          // fake jwt-like payload (not signed; only for local demo decode)
+          const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" })).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+          const payload = btoa(JSON.stringify({
+            sub: "55c526cb-9f70-4486-a232-3710e6f3df38",
+            email: "demo@example.com",
+            iat: now,
+            exp,
+          })).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+          const access = `${header}.${payload}.demo`;
+          const sample = {
+            type: "xai",
+            access_token: access,
+            refresh_token: "demo-refresh-token-replace-me",
+            id_token: access,
+            token_type: "Bearer",
+            expires_in: 21600,
+            expired: new Date(exp * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+            last_refresh: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+            sub: "55c526cb-9f70-4486-a232-3710e6f3df38",
+            base_url: "https://api.x.ai/v1",
+            token_endpoint: TOKEN_ENDPOINT,
+            auth_kind: "oauth",
+            email: "demo@example.com",
+          };
+          els.input.value = JSON.stringify(sample, null, 2);
+          scheduleConvert();
+        }
+
+        // events
+        els.input.addEventListener("input", scheduleConvert);
+        els.btnClear.addEventListener("click", () => {
+          els.input.value = "";
+          scheduleConvert();
+        });
+        els.btnSample.addEventListener("click", fillSample);
+        els.btnCopy.addEventListener("click", copyOutput);
+        els.btnDownload.addEventListener("click", downloadOutput);
+        els.formatButtons.forEach((btn) => {
+          btn.addEventListener("click", () => setFormat(btn.dataset.format));
+        });
+
+        // drag-drop
+        ["dragenter", "dragover"].forEach((type) => {
+          els.inputPanel.addEventListener(type, (event) => {
+            event.preventDefault();
+            els.inputPanel.classList.add("drop-active");
+          });
+        });
+        ["dragleave", "drop"].forEach((type) => {
+          els.inputPanel.addEventListener(type, (event) => {
+            event.preventDefault();
+            if (type === "drop") {
+              const files = [...(event.dataTransfer?.files || [])];
+              if (!files.length) return;
+              Promise.all(files.map((file) => file.text())).then((parts) => {
+                const existing = els.input.value.trim();
+                const incoming = parts.join("\n");
+                els.input.value = existing ? `${existing}\n${incoming}` : incoming;
+                scheduleConvert();
+              });
+            }
+            els.inputPanel.classList.remove("drop-active");
+          });
+        });
+
+        setFormat("cpa");
+      })();
+    </script>
+  </body>
+</html>
