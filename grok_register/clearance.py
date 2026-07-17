@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 # CF-fronted x.ai family roots (no path suffix; path pages share host clearance)
 DEFAULT_CLEARANCE_URLS = (
@@ -134,11 +134,27 @@ def clearance_proxy_url() -> str:
 
 
 def playwright_proxy_settings() -> dict[str, str] | None:
-    """Playwright launch/context proxy dict, or None for direct."""
+    """Playwright launch/context proxy dict, or None for direct.
+
+    Chromium often rejects user:pass embedded in server URL with
+    net::ERR_INVALID_AUTH_CREDENTIALS. Split credentials into
+    username/password fields instead.
+    """
     url = register_proxy_url()
     if not url:
         return None
-    return {"server": url}
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        # Non-URL form; pass through and let Playwright report errors.
+        return {"server": url}
+    port = f":{parsed.port}" if parsed.port else ""
+    server = f"{parsed.scheme}://{parsed.hostname}{port}"
+    settings: dict[str, str] = {"server": server}
+    if parsed.username is not None:
+        # urlparse keeps percent-encoding; unquote for real credentials.
+        settings["username"] = unquote(parsed.username)
+        settings["password"] = unquote(parsed.password or "")
+    return settings
 
 
 def httpx_proxy_mounts() -> str | None:
