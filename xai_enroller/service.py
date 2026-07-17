@@ -290,6 +290,7 @@ class EventTerminal:
         "token_failed",
         "token_transport_failed",
         "unknown_page",
+        "consent_invalid_action",
     }
     _TRANSIENT_REASONS = {
         "authorization_transport_failed",
@@ -302,6 +303,7 @@ class EventTerminal:
         "token_failed",
         "token_transport_failed",
         "unknown_page",
+        "consent_invalid_action",
     }
 
     def __init__(self, mode="user", output=None):

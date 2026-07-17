@@ -434,11 +434,31 @@ class PlaywrightExecutor:
                         await page.wait_for_timeout(self.COOKIE_WAIT_MS)
                         continue
 
+                    if "invalid action" in text_lower:
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION,
+                            "consent_invalid_action",
+                        )
+
                     if "/oauth2/device/consent" in parsed.path or any(
                         marker in text_lower
                         for marker in ("authorize grok build", "授权 grok build")
                     ):
                         if not consent_submitted:
+                            # accounts.x.ai consent form keeps action in a hidden
+                            # input filled by React click handlers. If hydration is
+                            # late, a bare submit posts action="" → "Invalid action".
+                            with suppress(Exception):
+                                await page.evaluate(
+                                    """() => {
+                                        const action = document.querySelector(
+                                          'input[name="action"]'
+                                        );
+                                        if (action) {
+                                          action.value = 'allow';
+                                        }
+                                    }"""
+                                )
                             allowed = await self._click_visible_exact(
                                 page, ("允许", "Allow", "Authorize", "Approve")
                             )

@@ -670,6 +670,7 @@ class AuthPipeline:
                 "browser_error",
                 "confirmation_timeout",
                 "challenge_required",
+                "consent_invalid_action",
                 "unknown_page",
             }
             if authorization.reason_code == "confirmation_timeout":
