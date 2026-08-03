@@ -1,9 +1,15 @@
 <!doctype html>
+<!--
+  [INPUT]: 依赖浏览器 File/Text/JSON API 与 grok-free-register 导出的 SSO/OAuth 凭证文本。
+  [OUTPUT]: 对外提供纯前端 CPA、sub2api、grok2api Web/Build 与 sso-to-oauth 转换页面。
+  [POS]: tools/GrokSession2CPAAndSub2API 的单页转换器，被注册出货后的人工导入流程消费。
+  [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+-->
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Grok Session → CPA / sub2api</title>
+    <title>Grok Session → CPA / sub2api / grok2api</title>
     <meta name="theme-color" content="#111827" />
     <style>
       :root {
@@ -47,8 +53,8 @@
       }
       .toolbar { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; align-items: center; margin-bottom: 12px; }
       .segmented {
-        display: inline-grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px;
-        width: min(760px, 100%); padding: 4px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface);
+        display: inline-grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 4px;
+        width: min(960px, 100%); padding: 4px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface);
       }
       .segmented button {
         min-height: 40px; border-radius: 8px; background: transparent; color: var(--muted); padding: 0 10px;
@@ -106,9 +112,12 @@
       .footer-note { margin-top: 14px; color: var(--muted); font-size: 0.84rem; line-height: 1.5; }
       @media (max-width: 960px) {
         .workspace { grid-template-columns: 1fr; }
-        .segmented { grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+        .segmented { grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; }
         .topbar { flex-direction: column; align-items: flex-start; }
         .chips { justify-content: flex-start; }
+      }
+      @media (max-width: 560px) {
+        .segmented { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       }
     </style>
   </head>
@@ -117,10 +126,10 @@
       <div class="topbar">
         <div>
           <p class="eyebrow">Grok Free Register toolkit</p>
-          <h1>Grok Session → CPA / sub2api</h1>
+          <h1>Grok Session → CPA / sub2api / grok2api</h1>
           <p class="subtitle">
             纯前端转换：把注册机 <code>xai-*.json</code> / SSO / accounts / sessions
-            转成 CPA、sub2api 导入包、batch 建号、或 sso-to-oauth 请求体。本地解析，不上传。
+            转成 CPA、sub2api、grok2api 导入包、batch 建号、或 sso-to-oauth 请求体。本地解析，不上传。
           </p>
         </div>
         <div class="chips">
@@ -134,6 +143,8 @@
         <div class="segmented" role="tablist" aria-label="输出格式">
           <button type="button" data-format="cpa" aria-pressed="true">CPA</button>
           <button type="button" data-format="sub2api" aria-pressed="false">sub2api 导入</button>
+          <button type="button" data-format="grok2api-web" aria-pressed="false">grok2api Web</button>
+          <button type="button" data-format="grok2api-build" aria-pressed="false">grok2api Build</button>
           <button type="button" data-format="batch" aria-pressed="false">batch 建号</button>
           <button type="button" data-format="sso" aria-pressed="false">sso-to-oauth</button>
         </div>
@@ -189,7 +200,7 @@
               • free 号 <code>base_url</code> 固定为 <code>https://cli-chat-proxy.grok.com/v1</code>（忽略 authenticated 里的 api.x.ai）<br />
               • 有 <code>refresh_token</code> 时：sub2api 账号<strong>不写</strong>顶层 <code>expires_at/auto_pause</code>，避免 6h 被 pause<br />
               • 无 refresh 时：写 access 的 exp + auto_pause，到期停用<br />
-              • 纯 SSO 输入只能出 <code>sso-to-oauth</code> 请求体；CPA/sub2api 需要 OAuth token
+              • 纯 SSO 输入可直接出 <code>grok2api Web</code> 导入包；CPA/sub2api/Build 需要 OAuth token
             </p>
           </div>
         </section>
@@ -203,6 +214,8 @@
         const HELP = {
           cpa: "CPA：type=xai，对齐注册机 cpa_ready / cli-proxy 风格",
           sub2api: "sub2api 数据导入：type=sub2api-data / accounts[] platform=grok",
+          "grok2api-web": "grok2api Web：导入到 /api/admin/v1/accounts/web/import 的 SSO 账号 JSON",
+          "grok2api-build": "grok2api Build：导入到 /api/admin/v1/accounts/import 的 OAuth 账号 JSON",
           batch: "batch 建号：POST /api/v1/admin/accounts/batch 的 {accounts:[]}",
           sso: "sso-to-oauth：POST /api/v1/admin/grok/sso-to-oauth 的 {sso_tokens:[]}",
         };
@@ -275,6 +288,13 @@
 
         function looksLikeJwt(value) {
           return typeof value === "string" && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value.trim());
+        }
+
+        function sanitizeSsoToken(value) {
+          let text = String(value || "").trim();
+          if (text.toLowerCase().startsWith("sso=")) text = text.slice(4).trim();
+          if (text.includes(";")) text = text.split(";")[0].trim();
+          return text.replace(/[\r\n\x00]/g, "").trim();
         }
 
         function normalizeTimestamp(value) {
@@ -403,7 +423,7 @@
             for (const src of oauthSources) {
               if (src.kind === "sso") {
                 const sso = firstNonEmpty(src.value.sso, src.value.sso_token, extractSsoFromCookies(src.value.cookies));
-                if (sso) ssoTokens.push({ token: sso, email: firstNonEmpty(src.value.email, src.value.user?.email), path: src.path });
+                if (sso) ssoTokens.push({ token: sanitizeSsoToken(sso), email: firstNonEmpty(src.value.email, src.value.user?.email), path: src.path });
               }
             }
             if (oauthSources.length || ssoTokens.length) {
@@ -428,7 +448,7 @@
                   if (src.kind === "oauth") oauthSources.push(src);
                   else {
                     const sso = firstNonEmpty(src.value.sso, src.value.sso_token, extractSsoFromCookies(src.value.cookies));
-                    if (sso) ssoTokens.push({ token: sso, email: firstNonEmpty(src.value.email), path: src.path });
+                    if (sso) ssoTokens.push({ token: sanitizeSsoToken(sso), email: firstNonEmpty(src.value.email), path: src.path });
                   }
                 }
                 if (!found.length) skipped.push({ path: `line-${index + 1}`, reason: "JSON 行未识别为 Grok 凭证" });
@@ -444,17 +464,18 @@
               const parts = line.split(":");
               if (parts.length >= 3) {
                 const email = parts[0];
-                const sso = parts.slice(2).join(":");
+                const sso = sanitizeSsoToken(parts.slice(2).join(":"));
                 if (looksLikeJwt(sso)) {
-                  ssoTokens.push({ token: sso.trim(), email: email.trim(), path: `accounts:${index + 1}` });
+                  ssoTokens.push({ token: sso, email: email.trim(), path: `accounts:${index + 1}` });
                   return;
                 }
               }
             }
 
             // pure SSO jwt line
-            if (looksLikeJwt(line)) {
-              ssoTokens.push({ token: line.trim(), path: `sso:${index + 1}` });
+            const ssoLine = sanitizeSsoToken(line);
+            if (looksLikeJwt(ssoLine)) {
+              ssoTokens.push({ token: ssoLine, path: `sso:${index + 1}` });
               return;
             }
 
@@ -486,6 +507,7 @@
             credsIn.id_token, credsIn.idToken,
             record.tokens?.id_token,
           );
+          const ssoToken = sanitizeSsoToken(firstNonEmpty(record.sso, record.sso_token, record.ssoToken, extractSsoFromCookies(record.cookies)));
           const tokenType = firstNonEmpty(record.token_type, credsIn.token_type, "Bearer");
           const accessClaims = parseJwtPayload(accessToken) || {};
           const idClaims = parseJwtPayload(idToken) || {};
@@ -587,6 +609,7 @@
             name,
             sub,
             hasRefresh,
+            ssoToken: looksLikeJwt(ssoToken) ? ssoToken : undefined,
             expiresAt: expiredIso,
             expiresUnix,
             cpa,
@@ -659,6 +682,56 @@
           };
         }
 
+        function buildGrok2apiWebDocument(ssoTokens, converted) {
+          const rows = [];
+          const seen = new Set();
+          for (const item of ssoTokens) {
+            const token = sanitizeSsoToken(item.token);
+            if (!looksLikeJwt(token) || seen.has(token)) continue;
+            seen.add(token);
+            rows.push(stripUndefined({
+              name: item.email ? `Grok Web ${item.email}` : undefined,
+              email: item.email,
+              sso_token: token,
+              tier: "auto",
+            }));
+          }
+          for (const item of converted) {
+            const token = sanitizeSsoToken(item.ssoToken);
+            if (!looksLikeJwt(token) || seen.has(token)) continue;
+            seen.add(token);
+            rows.push(stripUndefined({
+              name: item.email ? `Grok Web ${item.email}` : item.name,
+              email: item.email,
+              user_id: item.sub,
+              sso_token: token,
+              tier: "auto",
+            }));
+          }
+          return {
+            provider: "grok_web",
+            accounts: rows,
+          };
+        }
+
+        function buildGrok2apiBuildDocument(converted) {
+          return {
+            accounts: converted.map((item) => stripUndefined({
+              provider: "grok_build",
+              name: item.email ? `Grok Build ${item.email}` : item.name,
+              client_id: "grok-cli",
+              access_token: item.cpa.access_token,
+              refresh_token: item.cpa.refresh_token,
+              id_token: item.cpa.id_token,
+              token_type: item.cpa.token_type || "Bearer",
+              expires_at: item.expiresAt,
+              expires_in: item.cpa.expires_in,
+              email: item.email,
+              sub: item.sub,
+            })),
+          };
+        }
+
         function buildCpaDocument(converted) {
           return converted.length === 1
             ? converted[0].cpa
@@ -674,6 +747,15 @@
           if (state.format === "sub2api") {
             if (!state.converted.length) throw new Error("sub2api 导入需要 OAuth 凭证。纯 SSO 请切换到 sso-to-oauth");
             return buildSub2apiDocument(state.converted, now);
+          }
+          if (state.format === "grok2api-web") {
+            const doc = buildGrok2apiWebDocument(state.ssoTokens, state.converted);
+            if (!doc.accounts.length) throw new Error("grok2api Web 需要 SSO。可粘贴 grok.txt / accounts.txt / auth-sessions.jsonl");
+            return doc;
+          }
+          if (state.format === "grok2api-build") {
+            if (!state.converted.length) throw new Error("grok2api Build 需要 OAuth 凭证。请使用 authenticated/cpa_ready 的 xai-*.json");
+            return buildGrok2apiBuildDocument(state.converted);
           }
           if (state.format === "batch") {
             if (!state.converted.length) throw new Error("batch 建号需要 OAuth 凭证。纯 SSO 请切换到 sso-to-oauth");
@@ -752,7 +834,9 @@
             els.output.value = state.outputText;
             els.btnCopy.disabled = false;
             els.btnDownload.disabled = false;
-            const count = state.format === "sso" ? state.ssoTokens.length : state.converted.length;
+            const count = Array.isArray(doc.accounts)
+              ? doc.accounts.length
+              : Array.isArray(doc.sso_tokens) ? doc.sso_tokens.length : state.converted.length;
             setStatus(els.outputStatus, `已生成 · ${count} 条`, "ok");
             setStatus(els.convertStatus, `OAuth ${state.converted.length} / SSO ${state.ssoTokens.length}`, "ok");
           } catch (error) {

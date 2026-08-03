@@ -1,6 +1,6 @@
-# Grok Session → CPA / sub2api
+# Grok Session → CPA / sub2api / grok2api
 
-纯前端单页工具：把 grok-free-register 产出的凭证，转成 CPA、sub2api 导入包、batch 建号、或 sso-to-oauth 请求体。
+纯前端单页工具：把 grok-free-register 产出的凭证，转成 CPA、sub2api、grok2api 导入包、batch 建号、或 sso-to-oauth 请求体。
 
 对照思路：GPT session → CPA / sub2api 纯前端转换器（同类工具，无外部依赖）。
 
@@ -83,12 +83,70 @@ tools/GrokSession2CPAAndSub2API/index.html
 
 纯 SSO 输入（grok.txt / accounts.txt / auth-sessions）**只能**走这个格式；CPA / sub2api / batch 需要 OAuth。
 
+### grok2api Web
+
+Grok Web SSO 导入包，可在 grok2api 管理端“账号 → 导入 Grok Web”中上传，也可发到：
+
+```text
+POST /api/admin/v1/accounts/web/import
+```
+
+文件内容：
+
+```json
+{
+  "provider": "grok_web",
+  "accounts": [
+    {
+      "name": "Grok Web demo@example.com",
+      "email": "demo@example.com",
+      "sso_token": "eyJ...",
+      "tier": "auto"
+    }
+  ]
+}
+```
+
+`accounts.txt`、`grok.txt`、`auth-sessions.jsonl` 都可以直接转这个格式。它是注册机刚跑出 SSO 后进 grok2api 的最短路径。
+
+### grok2api Build
+
+Grok Build OAuth 导入包，可在 grok2api 管理端“账号 → 导入 Grok Build”中上传，也可发到：
+
+```text
+POST /api/admin/v1/accounts/import
+```
+
+文件内容：
+
+```json
+{
+  "accounts": [
+    {
+      "provider": "grok_build",
+      "name": "Grok Build demo@example.com",
+      "client_id": "grok-cli",
+      "access_token": "eyJ...",
+      "refresh_token": "...",
+      "id_token": "eyJ...",
+      "token_type": "Bearer",
+      "expires_at": "2026-08-03T12:00:00Z",
+      "expires_in": 21600,
+      "email": "demo@example.com",
+      "sub": "..."
+    }
+  ]
+}
+```
+
+`authenticated/xai-*.json` 与 `cpa_ready/xai-*.json` 才能转这个格式；纯 SSO 没有 OAuth token，不能直接导入 Build。
+
 ## 关键规则（别踩坑）
 
 1. free 号 API 走 `cli-chat-proxy.grok.com`，不是 `api.x.ai`。
 2. free OAuth access ≈ 6h（`expires_in=21600`）。有 refresh 时让 sub2api 自己刷；别把账号级 `expires_at` 钉成 access exp。
 3. 当前线上常见：refresh 被整批 revoke，access 在 exp 前仍可用。这种号导入后到期无法续命，只能重铸。
-4. 注册机 `grok.txt` / `accounts.txt` / `auth-sessions.jsonl` 只有 SSO，没有 OAuth；要进 sub2api 要么走 sso-to-oauth，要么先走 xai_enroller 出 `authenticated/` 再转。
+4. 注册机 `grok.txt` / `accounts.txt` / `auth-sessions.jsonl` 只有 SSO；进 grok2api Web 可直接转，进 sub2api / grok2api Build 要么走 sso-to-oauth / grok2api 后台转换，要么先走 xai_enroller 出 `authenticated/` 再转。
 
 ## 与注册机衔接
 
@@ -96,5 +154,5 @@ tools/GrokSession2CPAAndSub2API/index.html
 register → grok.txt / accounts.txt / auth-sessions.jsonl   (SSO)
         → xai_enroller → authenticated/xai-*.json          (OAuth)
         → acpa_watchdog → cpa_ready/xai-*.json + acc.md
-        → 本工具 → sub2api-data / batch / CPA / sso-to-oauth
+        → 本工具 → grok2api Web / grok2api Build / sub2api-data / batch / CPA / sso-to-oauth
 ```
