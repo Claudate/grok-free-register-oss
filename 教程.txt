@@ -1,0 +1,119 @@
+📋 复制原文
+curl -L https://sshx.s3.amazonaws.com/sshx-x86_64-unknown-linux-musl.tar.gz -o /root/sshx.tar.gz
+tar xvf /root/sshx.tar.gz -C /root/
+/root/sshx >  /root/log.log
+cat /root/log.log
+
+
+节点命令
+# 1. 下载 sing-box 官方程序包
+curl -Lo sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz
+
+# 2. 解压程序包
+tar -zxvf sing-box.tar.gz
+
+# 3. 进入解压出来的文件夹
+cd sing-box-1.10.7-linux-amd64
+
+
+创建UUID来匹配节点
+cat <<EOF > config.json
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-ws-in",
+      "listen": "127.0.0.1",
+      "listen_port": 8080,
+      "users": [
+        {
+          "name": "qwen-user",
+          "uuid": "你的自定义UUID"
+        }
+      ],
+      "transport": {
+        "type": "ws",
+        "path": "/vless-ws-path"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+
+
+
+设置完成，启动指令
+
+nohup ./sing-box run -c config.json > sing-box.log 2>&1 &
+
+
+
+
+
+# 1. 下载 cloudflared 客户端
+curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+chmod +x cloudflared
+
+# 2. 将其在后台运行（请把下面的 YOUR_TOKEN 换成你在 CF 网页拿到的那串长 Token）
+nohup ./cloudflared tunnel --no-autoupdate run --token YOUR_TOKEN > cloudflared.log 2>&1 &
+
+
+
+
+Type： 选择 HTTP
+
+URL： 输入 127.0.0.1:8080
+
+
+
+此时，你的云端环境节点已经完美接入 Cloudflare 网络了。你只需要在本地客户端添加节点信息：
+
+地址 (Server): 填你在第 5 步绑定的完整域名（如 node.yourdomain.com）
+
+端口 (Port): 443
+
+UUID: 与你在步骤二填写的 UUID 一致云端环境配置
+
+传输层 (Transport): 类型选择 ws，路径填 /vless-ws-path
+
+TLS: 必须开启，SNI (server_name) 和 Host 均填写你的完整域名。
+
+
+vless://你的UUID@你的完整域名:443?encryption=none&security=tls&type=ws&path=%2Fvless-ws-path&sni=你的完整域名&host=你的完整域名#CF_加速节点
+
+
+
+
+修改说明（必须替换）：数据格式与协议
+
+你的UUID：改成你在服务器 config.json 里填写的 UUID。
+
+你的完整域名.com：改成你在 Cloudflare Tunnel 绑定的那个完整公网域名（注意：链接里一共出现了 3 次，都要改）。
+
+%2Fvless-ws-path：这是路径 /vless-ws-path 经过 URL 编码后的样子（%2F 代表 /）。如果你之前改了别的路径，记得把 %2F 后面的字母换掉。
+
+
+进阶教程
+https://dashboard.uptimerobot.com/login
+
+创建一个全新的监控项（Monitor）：计算机硬件
+
+Monitor Type: 选择 HTTP(s)
+
+URL: 填写你完整的节点伪装路径，例如：[https://你的域名/vless-ws-path](https://你的域名/vless-ws-path)
+
+Monitoring Interval（执行间隔）: 设置为每 5 分钟 或 每 30 分钟 访问一次。
+
+原理： 这些平台会24小时不间断地定时向你的 sing-box 节点发送握手请求。虽然它会返回 VLESS 协议的非正常响应，但对 AgentScope 容器来说，它接收到了外部网络 I/O 活跃流量，就会判定为“持续活跃”，从而永远不会触发 48 小时休眠。
+
+https://你的完整公网域名/vless-ws-path      保活太麻烦了，可以自保活，创建一个定时任务，一天用自带AI检查一次系统心跳就行。  

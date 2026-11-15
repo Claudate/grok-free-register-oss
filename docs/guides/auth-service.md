@@ -65,3 +65,11 @@ q       安全退出
 ```
 
 快照默认每 30 秒更新一次；内容无变化时终端保持安静。有效快照和已生成凭据会在重启后继续使用。
+
+## 排障
+
+卡在 `needs_interaction (unknown_page)`、`rate_limited`、队列不动，或「别人挂了这边正常」时，按 [运行状态与排障](runtime-troubleshooting.md) 在**出问题的机器**上查清障 env 与 FlareSolverr，不要先改代码。
+
+## 排障
+
+卡在 `needs_interaction (unknown_page)`、`rate_limited`、队列不动，或「别人挂了这边正常」时，按 [运行状态与排障](runtime-troubleshooting.md) 在**出问题的机器**上查清障 env 与 FlareSolverr，不要先改代码。

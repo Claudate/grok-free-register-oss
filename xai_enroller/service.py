@@ -1,6 +1,8 @@
 """Interactive composition for the asynchronous local authentication service."""
 
 import asyncio
+import atexit
+import fcntl
 import os
 import secrets
 import sys
@@ -12,15 +14,49 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .inventory import InventoryError
+from .reconcile import reconcile_auth_files_into_ledger
 
 
 DEFAULT_LOCAL_AUTH_DIR = Path.home() / "Downloads" / "grok-free-register-auth"
 AUTHENTICATED_DIRNAME = "authenticated"
 CLAIMED_DIRNAME = "claimed"
+SERVICE_LOCK_NAME = ".auth-service.lock"
 
 
 class AuthServiceConfigurationError(ValueError):
     pass
+
+
+class AuthServiceAlreadyRunningError(RuntimeError):
+    """Another auth-service process holds the exclusive lock."""
+
+
+def acquire_service_lock(local_auth_dir):
+    """Exclusive flock so stacked auth-service processes cannot share one ledger."""
+    directory = Path(local_auth_dir).expanduser()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = directory / SERVICE_LOCK_NAME
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise AuthServiceAlreadyRunningError(
+            f"another auth-service already holds {lock_path}"
+        ) from error
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+
+    def _release():
+        with suppress(Exception):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with suppress(Exception):
+            handle.close()
+
+    atexit.register(_release)
+    return handle
 
 
 class InteractiveCommandPrompt:
@@ -206,6 +242,8 @@ class AuthServiceSettings:
     sync_seconds: int = 30
     retry_seconds: int = 60
     min_authorization_interval_seconds: float = 10.0
+    # Concurrent browser authorizations in the service path. Keep small (1–3).
+    authorization_concurrency: int = 2
 
     @classmethod
     def from_environ(cls, env=None):
@@ -237,9 +275,16 @@ class AuthServiceSettings:
             min_authorization_interval_seconds = float(
                 env.get("XAI_AUTH_SERVICE_MIN_INTERVAL_SEC", "10")
             )
+            # Prefer service-specific knobs; fall back to enroller concurrency if set.
+            concurrency_raw = (
+                env.get("XAI_AUTH_SERVICE_CONCURRENCY")
+                or env.get("XAI_ENROLLER_CONCURRENCY")
+                or "2"
+            )
+            authorization_concurrency = int(concurrency_raw)
         except ValueError as exc:
             raise AuthServiceConfigurationError(
-                "auth service intervals must be numeric"
+                "auth service intervals/concurrency must be numeric"
             ) from exc
         if not 5 <= sync_seconds <= 3600:
             raise AuthServiceConfigurationError(
@@ -253,6 +298,11 @@ class AuthServiceSettings:
             raise AuthServiceConfigurationError(
                 "XAI_AUTH_SERVICE_MIN_INTERVAL_SEC must be between 0 and 3600"
             )
+        # Hard cap at 3 for the interactive service path — user asked 2–3, not more.
+        if not 1 <= authorization_concurrency <= 3:
+            raise AuthServiceConfigurationError(
+                "XAI_AUTH_SERVICE_CONCURRENCY must be between 1 and 3"
+            )
         return cls(
             source_kind=source_kind,
             ssh_host=ssh_host or None,
@@ -262,6 +312,7 @@ class AuthServiceSettings:
             sync_seconds=sync_seconds,
             retry_seconds=retry_seconds,
             min_authorization_interval_seconds=min_authorization_interval_seconds,
+            authorization_concurrency=authorization_concurrency,
         )
 
 
@@ -274,11 +325,15 @@ class EventTerminal:
         "browser_error",
         "challenge_required",
         "confirmation_timeout",
+        "consent_invalid_action",
         "device_flow_failed",
         "device_flow_invalid",
         "device_flow_refresh_failed",
+        "device_verify_failed",
         "imported",
         "internal_error",
+        "login_required",
+        "mfa_required",
         "oauth_denied",
         "oauth_expired",
         "oauth_rejected",
@@ -287,23 +342,26 @@ class EventTerminal:
         "sink_failed",
         "sink_unconfigured",
         "snapshot_sync_failed",
+        "submit_missing",
         "token_failed",
         "token_transport_failed",
         "unknown_page",
-        "consent_invalid_action",
+        "unsafe_page",
     }
     _TRANSIENT_REASONS = {
         "authorization_transport_failed",
         "browser_error",
         "challenge_required",
         "confirmation_timeout",
+        "consent_invalid_action",
         "device_flow_failed",
         "device_flow_refresh_failed",
+        "device_verify_failed",
         "sink_failed",
         "token_failed",
         "token_transport_failed",
         "unknown_page",
-        "consent_invalid_action",
+        "unsafe_page",
     }
 
     def __init__(self, mode="user", output=None):
@@ -337,11 +395,51 @@ class EventTerminal:
             source = {"local": "本机", "ssh": "远端"}.get(
                 data.get("source_kind"), "等待同步"
             )
+            concurrency = data.get("authorization_concurrency")
+            concurrency_text = (
+                f" | 并发 {concurrency}" if concurrency is not None else ""
+            )
+            executor = data.get("executor")
+            executor_text = {
+                "http": " | 协议HTTP",
+                "playwright": " | 浏览器",
+            }.get(executor, f" | 执行器 {executor}" if executor else "")
+            imported = data.get("imported_unique")
+            pending = self._pending(data.get("pending_total"))
+            resume_bits = []
+            if imported is not None:
+                resume_bits.append(f"已导入 {imported}")
+            resume_bits.append(f"待处理 {pending}")
+            resume_bits.append(f"可用 {data['available']}")
+            resume_text = " | " + " | ".join(resume_bits)
             return (
                 f"[✓] 本地认证服务已启动 | 来源 {source} | "
-                f"输出 {data['destination']} | 待处理 — | 可用 {data['available']}"
+                f"输出 {data['destination']}{resume_text}"
+                f"{concurrency_text}{executor_text}"
             )
         if kind == "service_started":
+            concurrency = data.get("authorization_concurrency")
+            executor = data.get("executor")
+            parts = []
+            if concurrency is not None:
+                parts.append(f"并发 {concurrency}")
+            if executor == "http":
+                parts.append("协议HTTP")
+            elif executor == "playwright":
+                parts.append("浏览器")
+            elif executor:
+                parts.append(str(executor))
+            imported = data.get("imported_unique")
+            if imported is not None:
+                parts.append(f"续跑已导入 {imported}")
+            pending = data.get("pending_total")
+            if pending is not None:
+                parts.append(f"待处理 {self._pending(pending)}")
+            starts = data.get("authorization_starts")
+            if starts:
+                parts.append(f"任务号续自 #{starts}")
+            if parts:
+                return f"[▶] 认证流水线运行中 | " + " | ".join(parts)
             return "[▶] 认证流水线运行中"
         if kind == "service_stopped":
             return "[■] 认证服务已停止"
@@ -399,7 +497,14 @@ class EventTerminal:
                 ),
                 "unknown": "[!] 未知命令 | 输入 help 查看命令",
             }
-            return states.get(data.get("state"), "[•] 控制命令已处理")
+            state = data.get("state")
+            if state in states:
+                return states[state]
+            if isinstance(state, str) and state.startswith("reconciled auth files:"):
+                return f"[↻] 已从本地凭据重建断点 | {state.split(':', 1)[1].strip()}"
+            if isinstance(state, str) and "already running" in state:
+                return "[!] 已有认证服务在运行 | 先结束旧进程"
+            return "[•] 控制命令已处理"
         if kind == "status":
             state = {"running": "运行中", "paused": "已暂停", "stopping": "停止中"}.get(
                 data.get("state"), "未知"
@@ -428,14 +533,27 @@ class EventTerminal:
                 f"处理中 {data['claiming']} | 已取用 {data['claimed']}"
             )
         if kind == "pipeline_error":
-            return f"[!] 认证流水线异常 | 阶段 {data.get('stage', 'unknown')}"
+            stage = data.get("stage", "unknown")
+            error_type = data.get("error_type")
+            fatal = data.get("fatal", True)
+            detail = f" | {error_type}" if error_type else ""
+            if fatal is False:
+                return f"[!] 认证任务异常（已隔离，继续跑）| 阶段 {stage}{detail}"
+            return f"[!] 认证流水线异常 | 阶段 {stage}{detail}"
         return None
 
     def _format_debug(self, kind, data):
         if kind == "service_started":
+            concurrency = data.get("authorization_concurrency")
+            concurrency_text = (
+                f"; concurrency={concurrency}" if concurrency is not None else ""
+            )
+            executor = data.get("executor")
+            executor_text = f"; executor={executor}" if executor else ""
             return (
                 "• service: running; "
                 f"min_interval={data['min_authorization_interval_seconds']:.1f}s"
+                f"{concurrency_text}{executor_text}"
             )
         if kind == "service_stopped":
             return "• service: stopped"
@@ -638,8 +756,25 @@ class AuthPipelineRunner:
 
 async def _run_interactive(runner, terminal):
     loop = asyncio.get_running_loop()
+    # Headless / nohup / redirected stdin: run the pipeline without a command
+    # prompt. Empty non-tty stdin would otherwise fire EOF → "q" immediately.
+    interactive = False
+    with suppress(Exception):
+        interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+    if not interactive:
+        terminal.emit(
+            (
+                "control",
+                {
+                    "state": "headless mode (no TTY); pipeline only — no s/take/p/r/c/q prompt",
+                },
+            )
+        )
+        await runner.run()
+        return
+
     commands = asyncio.Queue()
-    prompt = InteractiveCommandPrompt()
+    prompt = InteractiveCommandPrompt(interactive=True)
     previous_output = terminal.output
     terminal.output = prompt.write_event
     prompt.write_event(
@@ -684,7 +819,7 @@ async def main_async(*, log_mode="user"):
 
     from .auth_pipeline import AuthPipeline
     from .config import Settings
-    from .executors import PlaywrightExecutor
+    from .executors import HTTPProtocolExecutor, PlaywrightExecutor
     from .inventory import CredentialInventory
     from .ledger import Ledger
     from .protocol import XAIProfile, XAIProtocol
@@ -695,15 +830,28 @@ async def main_async(*, log_mode="user"):
     )
     from .sinks import LocalAuthFileSink
 
-    service_settings = AuthServiceSettings.from_environ()
     merged = prepare_local_service_environment()
+    service_settings = AuthServiceSettings.from_environ({**os.environ, **merged})
+    # playwright (browser) | http / protocol (pure HTTP device-verify)
+    executor_kind = (
+        merged.get("XAI_AUTH_SERVICE_EXECUTOR")
+        or os.environ.get("XAI_AUTH_SERVICE_EXECUTOR")
+        or merged.get("XAI_ENROLLER_AUTH_EXECUTOR")
+        or os.environ.get("XAI_ENROLLER_AUTH_EXECUTOR")
+        or "playwright"
+    ).strip().lower()
+    if executor_kind in {"protocol", "http_protocol", "http-protocol"}:
+        executor_kind = "http"
+    if executor_kind not in {"http", "playwright"}:
+        raise ValueError("XAI_AUTH_SERVICE_EXECUTOR must be playwright or http")
+
     merged["XAI_ENROLLER_SOURCE_KIND"] = "remote"
-    merged["XAI_ENROLLER_AUTH_EXECUTOR"] = "playwright"
-    merged["XAI_ENROLLER_CONCURRENCY"] = "1"
+    merged["XAI_ENROLLER_AUTH_EXECUTOR"] = executor_kind
+    merged["XAI_ENROLLER_CONCURRENCY"] = str(service_settings.authorization_concurrency)
     settings = Settings.from_environ(merged)
     terminal = EventTerminal(mode=log_mode)
 
-    # CF prewarm via external FlareSolverr (:8191). Separate from REGISTER_PROXY.
+    # CF prewarm via chatgpt2api FlareSolverr (:8191). Separate from REGISTER_PROXY.
     try:
         from grok_register.clearance import (
             format_prewarm_log,
@@ -722,11 +870,56 @@ async def main_async(*, log_mode="user"):
         terminal.emit(("control", {"state": f"clearance_prewarm_skip: {exc}"}))
         proxy_url = None
 
+    # Prevent stacked processes from racing the same ledger / browser pool.
+    try:
+        acquire_service_lock(settings.local_auth_dir)
+    except AuthServiceAlreadyRunningError:
+        terminal.emit(
+            (
+                "control",
+                {
+                    "state": (
+                        "another auth-service is already running for this "
+                        "local auth dir; exit the other instance first"
+                    )
+                },
+            )
+        )
+        print(
+            "[✗] 已有认证服务在运行（同一进度目录）| 先结束旧进程再启动",
+            file=sys.stderr,
+        )
+        return
+
     # httpx honors REGISTER_PROXY/HTTP_PROXY only when passed explicitly
     client = httpx.AsyncClient(proxy=proxy_url) if proxy_url else httpx.AsyncClient()
     pipeline = None
     try:
         ledger = Ledger(settings.ledger_path, settings.source_salt)
+        authenticated_dir = Path(settings.local_auth_dir) / AUTHENTICATED_DIRNAME
+        register_root = Path(service_settings.register_root).expanduser()
+        cpa_ready_dir = register_root / "keys" / "cpa_ready"
+        reconciled = await asyncio.to_thread(
+            reconcile_auth_files_into_ledger,
+            ledger,
+            authenticated_dir=authenticated_dir,
+            extra_dirs=(cpa_ready_dir,),
+        )
+        if reconciled.get("with_email"):
+            terminal.emit(
+                (
+                    "control",
+                    {
+                        "state": (
+                            f"reconciled auth files: "
+                            f"scanned={reconciled['scanned']} "
+                            f"with_email={reconciled['with_email']} "
+                            f"new={reconciled['newly_imported']} "
+                            f"copied={reconciled['copied']}"
+                        )
+                    },
+                )
+            )
         snapshot_path = Path(settings.local_auth_dir) / "source-snapshot.jsonl"
         if service_settings.source_kind == "ssh":
             synchronizer = SSHSnapshotSynchronizer(
@@ -754,25 +947,40 @@ async def main_async(*, log_mode="user"):
             XAIProfile.default(),
             default_poll_interval=settings.poll_interval,
         )
-        executor = PlaywrightExecutor(concurrency=1)
+        if executor_kind == "http":
+            executor = HTTPProtocolExecutor(
+                client,
+                concurrency=service_settings.authorization_concurrency,
+            )
+        else:
+            executor = PlaywrightExecutor(
+                concurrency=service_settings.authorization_concurrency
+            )
         sink = LocalAuthFileSink(
-            Path(settings.local_auth_dir) / AUTHENTICATED_DIRNAME,
+            authenticated_dir,
             name_secret=settings.source_salt,
         )
         inventory = CredentialInventory(
             ledger,
-            Path(settings.local_auth_dir) / AUTHENTICATED_DIRNAME,
+            authenticated_dir,
             Path(settings.local_auth_dir) / CLAIMED_DIRNAME,
         )
         recovered = await asyncio.to_thread(inventory.recover)
         if recovered:
             terminal.emit(("control", {"state": f"recovered {recovered} claims"}))
+        ledger_counts = ledger.aggregate_counts()
         terminal.emit(
             (
                 "startup",
                 {
                     "destination": f"{AUTHENTICATED_DIRNAME}/",
                     "source_kind": service_settings.source_kind,
+                    "authorization_concurrency": (
+                        service_settings.authorization_concurrency
+                    ),
+                    "executor": executor_kind,
+                    "imported_unique": ledger_counts.get("imported_unique", 0),
+                    "authorization_starts": ledger.authorization_start_count(),
                     **ledger.inventory_counts(),
                 },
             )
@@ -787,6 +995,7 @@ async def main_async(*, log_mode="user"):
             min_authorization_interval=(
                 service_settings.min_authorization_interval_seconds
             ),
+            authorization_concurrency=service_settings.authorization_concurrency,
             event_callback=lambda kind, data: terminal.emit((kind, data)),
         )
         # Keep base cooldown configurable; the gate grows it after consecutive trips.
@@ -844,9 +1053,12 @@ def _known_configuration_key(error):
 
 def _print_unexpected_service_failure(error, *, log_mode):
     if log_mode == "debug":
-        detail = f"异常类别 {type(error).__name__}"
+        detail = f"异常类别 {type(error).__name__}: {error}"
     else:
-        detail = "使用 bash auth-service.sh --debug 查看异常类别"
+        detail = (
+            f"异常类别 {type(error).__name__} | "
+            "使用 bash auth-service.sh --debug 查看完整信息"
+        )
     print(f"[✗] 认证服务异常终止 | {detail}", file=sys.stderr)
 
 

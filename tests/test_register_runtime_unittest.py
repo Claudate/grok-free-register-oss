@@ -1,3 +1,10 @@
+"""
+[INPUT]: 依赖 grok_register.register、Metrics 与本文件内 fake Playwright/request 对象
+[OUTPUT]: 提供注册运行时、配置错误、清障诊断、注册持久化和 worker 边界回归测试
+[POS]: tests 的 register 运行时测试，锁定 CLI 入口错误语义与 CSP 边界行为
+[PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+"""
+
 import asyncio
 import json
 import sys
@@ -20,6 +27,134 @@ requests_mod.post = lambda *_args, **_kwargs: None
 sys.modules.setdefault("requests", requests_mod)
 
 from grok_register import register
+
+
+def test_sanitize_terminal_error_keeps_reason_and_redacts_secrets():
+    error = RuntimeError(
+        "Page.goto failed for https://user:password@proxy.example:3129 "
+        "sso=eyJaaaaaaaaaaaaaaaa.eyJbbbbbbbbbbbbbbbb.eyJcccccccccccccccc "
+        "token=secret-value"
+    )
+
+    rendered = register.sanitize_terminal_error(error)
+
+    assert rendered.startswith("RuntimeError: Page.goto failed")
+    assert "user:password@" not in rendered
+    assert "eyJaaaaaaaa" not in rendered
+    assert "sso=<redacted>" in rendered
+    assert "token=<redacted>" in rendered
+
+
+def test_config_fetch_failure_reports_missing_fields_and_runtime_state(monkeypatch):
+    monkeypatch.delenv("CLEARANCE_ENABLED", raising=False)
+    monkeypatch.delenv("REGISTER_PROXY", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("ALL_PROXY", raising=False)
+    register.SITE_KEY = ""
+    register.ACTION_ID = ""
+    register.STATE_TREE = ""
+
+    message = register._format_config_fetch_failure(
+        1,
+        last_error=RuntimeError("Config incomplete on page"),
+        page_summary="url=https://accounts.x.ai marker=cloudflare_challenge",
+    )
+
+    assert "missing=SITE_KEY,ACTION_ID,STATE_TREE" in message
+    assert "attempts=1" in message
+    assert "marker=cloudflare_challenge" in message
+    assert "clearance=disabled" in message
+    assert "egress=direct" in message
+    assert "CLEARANCE_ENABLED=0" in message
+    assert "CLEARANCE_PROXY" in message
+
+
+def test_config_fetch_failure_reports_stale_clearance_when_challenge_remains(monkeypatch):
+    monkeypatch.setenv("CLEARANCE_ENABLED", "1")
+    monkeypatch.delenv("REGISTER_PROXY", raising=False)
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("ALL_PROXY", raising=False)
+    register.SITE_KEY = "site-key"
+    register.ACTION_ID = ""
+    register.STATE_TREE = "state-tree"
+
+    message = register._format_config_fetch_failure(
+        1,
+        last_error=RuntimeError("Config incomplete on page"),
+        page_summary="url=https://accounts.x.ai marker=cloudflare_challenge",
+    )
+
+    assert "missing=ACTION_ID" in message
+    assert "clearance=enabled" in message
+    assert "FlareSolverr returns cf+" in message
+    assert "CLEARANCE_PROXY/REGISTER_PROXY" in message
+
+
+def test_config_fetch_error_is_reported_as_configuration_error():
+    assert issubclass(register.ConfigFetchError, ValueError)
+
+
+def test_clearance_prewarm_failure_reports_actionable_message(monkeypatch):
+    monkeypatch.setenv("FLARESOLVERR_URL", "http://127.0.0.1:8191")
+
+    message = register._format_clearance_prewarm_failure(
+        {
+            "enabled": True,
+            "ok": False,
+            "flaresolverr": "http://127.0.0.1:8191",
+            "errors": ["accounts.x.ai: <urlopen error [Errno 61] Connection refused>"],
+        }
+    )
+
+    assert message.startswith("Clearance prewarm failed:")
+    assert "Connection refused" in message
+    assert "verify FLARESOLVERR_URL" in message
+    assert "CLEARANCE_REQUIRED=1" in message
+    assert "CLEARANCE_PROXY/REGISTER_PROXY" in message
+
+
+def test_clearance_required_defaults_to_false(monkeypatch):
+    monkeypatch.delenv("CLEARANCE_REQUIRED", raising=False)
+
+    assert register._clearance_required() is False
+
+
+def test_clearance_required_accepts_explicit_true(monkeypatch):
+    monkeypatch.setenv("CLEARANCE_REQUIRED", "1")
+
+    assert register._clearance_required() is True
+
+
+def test_next_static_js_urls_include_dpl_query_chunks():
+    html = (
+        '<script src="/_next/static/chunks/plain.js"></script>'
+        '<script src="/_next/static/chunks/app.js?dpl=abc123"></script>'
+        '<script src="https://example.test/ignored.js?dpl=abc123"></script>'
+    )
+
+    assert register._next_static_js_urls(html) == [
+        "/_next/static/chunks/plain.js",
+        "/_next/static/chunks/app.js?dpl=abc123",
+    ]
+
+
+def test_clearance_prewarm_failure_does_not_trust_inconsistent_ok_flag(monkeypatch):
+    monkeypatch.setenv("FLARESOLVERR_URL", "http://127.0.0.1:8191")
+
+    message = register._format_clearance_prewarm_failure(
+        {
+            "enabled": True,
+            "ok": True,
+            "cookies": 0,
+            "detail": [],
+            "errors": ["FlareSolverr connection refused"],
+        }
+    )
+
+    assert message.startswith("Clearance prewarm failed:")
+    assert "FlareSolverr connection refused" in message
 
 
 def test_registration_persists_exact_session_before_legacy_outputs(monkeypatch):

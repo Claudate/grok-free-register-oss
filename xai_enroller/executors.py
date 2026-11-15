@@ -10,6 +10,7 @@ import httpx
 from grok_register.clearance import (
     apply_clearance_to_context,
     cached_user_agent,
+    next_playwright_proxy_settings,
     playwright_proxy_settings,
 )
 
@@ -44,6 +45,196 @@ class HTTPProbeExecutor:
             AuthorizationStatus.NEEDS_INTERACTION, "http_probe_inconclusive"
         )
 
+
+class HTTPProtocolExecutor:
+    """Device-verify over pure HTTP (no browser).
+
+    accounts.x.ai HTML is CF-gated (often 403 without browser TLS/clearance), but
+    auth.x.ai form endpoints accept the SSO cookie:
+
+      POST /oauth2/device/verify  → 303 consent
+      POST /oauth2/device/approve → 303 done  (hidden action must be ``allow``)
+
+    Polling the token endpoint is still done by XAIProtocol after AUTHORIZED.
+    """
+
+    VERIFY_URL = "https://auth.x.ai/oauth2/device/verify"
+    APPROVE_URL = "https://auth.x.ai/oauth2/device/approve"
+    DEFAULT_UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/146.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self, client: httpx.AsyncClient, concurrency: int = 2):
+        self.client = client
+        self.concurrency = max(1, int(concurrency))
+        self._semaphore = asyncio.Semaphore(self.concurrency)
+
+    def _browser_headers(self, *, referer: str) -> dict[str, str]:
+        ua = ""
+        with suppress(Exception):
+            ua = cached_user_agent() or ""
+        return {
+            "User-Agent": ua or self.DEFAULT_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://accounts.x.ai",
+            "Referer": referer,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+
+    def _cookie_header(self, source: SourceRecord) -> str:
+        parts: list[str] = []
+        seen: set[str] = set()
+        if source.cookies:
+            for cookie in source.cookies:
+                name = str(cookie.get("name") or "").strip()
+                if not name or name in seen:
+                    continue
+                parts.append(f"{name}={cookie.get('value') or ''}")
+                seen.add(name)
+        if "sso" not in seen and source.sso_token:
+            parts.insert(0, f"sso={source.sso_token}")
+        elif source.sso_token and "sso" in seen:
+            # Prefer the live source token over a possibly stale session cookie.
+            rebuilt = [f"sso={source.sso_token}"]
+            for item in parts:
+                if not item.startswith("sso="):
+                    rebuilt.append(item)
+            parts = rebuilt
+        return "; ".join(parts)
+
+    async def confirm(self, source: SourceRecord, flow: DeviceFlow):
+        parsed = urlparse(flow.verification_url)
+        if parsed.scheme != "https" or not parsed.hostname or not (
+            parsed.hostname == "x.ai" or parsed.hostname.endswith(".x.ai")
+        ):
+            return AuthorizationResult(
+                AuthorizationStatus.NEEDS_INTERACTION, "invalid_url"
+            )
+        if not source.sso_token:
+            return AuthorizationResult(
+                AuthorizationStatus.NEEDS_INTERACTION, "login_required"
+            )
+
+        cookie = self._cookie_header(source)
+        referer = flow.verification_url
+        headers = self._browser_headers(referer=referer)
+        headers["Cookie"] = cookie
+
+        async with self._semaphore:
+            try:
+                verify = await self.client.post(
+                    self.VERIFY_URL,
+                    data={"user_code": flow.user_code},
+                    headers=headers,
+                    follow_redirects=False,
+                )
+            except Exception:
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "browser_error"
+                )
+
+            location = verify.headers.get("location") or ""
+            loc = urlparse(location)
+            error = parse_qs(loc.query).get("error", [None])[0]
+            if error == "rate_limited":
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "rate_limited"
+                )
+            if error:
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "device_verify_failed"
+                )
+            if verify.status_code not in {301, 302, 303, 307, 308}:
+                body = ""
+                with suppress(Exception):
+                    body = (await verify.aread()).decode("utf-8", errors="replace")[:800]
+                text = body.lower()
+                if verify.status_code == 403 and any(
+                    marker in text for marker in ("challenge", "cf-chl", "captcha")
+                ):
+                    return AuthorizationResult(
+                        AuthorizationStatus.NEEDS_BROWSER, "challenge"
+                    )
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "device_verify_failed"
+                )
+            if "/oauth2/device/done" in (loc.path or ""):
+                return AuthorizationResult(AuthorizationStatus.AUTHORIZED, "confirmed")
+
+            consent_referer = (
+                location
+                if location.startswith("http")
+                else f"https://accounts.x.ai{location}"
+                if location.startswith("/")
+                else f"https://accounts.x.ai/oauth2/device/consent?user_code={flow.user_code}"
+            )
+            approve_headers = self._browser_headers(referer=consent_referer)
+            approve_headers["Cookie"] = cookie
+            try:
+                approve = await self.client.post(
+                    self.APPROVE_URL,
+                    data={
+                        "user_code": flow.user_code,
+                        "action": "allow",
+                        "principal_type": "User",
+                        "principal_id": "",
+                    },
+                    headers=approve_headers,
+                    follow_redirects=False,
+                )
+            except Exception:
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "browser_error"
+                )
+
+            approve_loc = approve.headers.get("location") or ""
+            approve_parsed = urlparse(approve_loc)
+            approve_error = parse_qs(approve_parsed.query).get("error", [None])[0]
+            if approve_error == "rate_limited":
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "rate_limited"
+                )
+            if approve_error:
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "device_verify_failed"
+                )
+
+            body = ""
+            with suppress(Exception):
+                body = (await approve.aread()).decode("utf-8", errors="replace")[:800]
+            text = body.lower()
+            if "invalid action" in text:
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "consent_invalid_action"
+                )
+            if approve.status_code // 100 == 2 and (
+                "device authorized" in text or "设备已授权" in text
+            ):
+                return AuthorizationResult(AuthorizationStatus.AUTHORIZED, "confirmed")
+            if approve.status_code in {301, 302, 303, 307, 308}:
+                path = approve_parsed.path or ""
+                if "/oauth2/device/done" in path or "device/done" in path:
+                    return AuthorizationResult(
+                        AuthorizationStatus.AUTHORIZED, "confirmed"
+                    )
+                # Some edges bounce through accounts again; treat any non-error
+                # redirect after action=allow as success — token poll is the truth.
+                if not approve_error:
+                    return AuthorizationResult(
+                        AuthorizationStatus.AUTHORIZED, "confirmed"
+                    )
+            if approve.status_code == 403 and any(
+                marker in text for marker in ("challenge", "cf-chl", "captcha")
+            ):
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_BROWSER, "challenge"
+                )
+            return AuthorizationResult(
+                AuthorizationStatus.NEEDS_INTERACTION, "unknown_page"
+            )
 
 class PlaywrightExecutor:
     ALLOWED_CONTROLS = frozenset({"Authorize", "Allow", "Continue", "Confirm"})
@@ -91,12 +282,59 @@ class PlaywrightExecutor:
         )
         return sorted(candidates)[-1] if candidates else None
 
+    @staticmethod
+    def _browser_connected(browser) -> bool:
+        if browser is None:
+            return False
+        is_connected = getattr(browser, "is_connected", None)
+        if not callable(is_connected):
+            return True
+        try:
+            return bool(is_connected())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_transport_error(error) -> bool:
+        """Node driver EPIPE / closed target / killed browser — recover by relaunch."""
+        if error is None:
+            return False
+        name = type(error).__name__
+        if name in {
+            "TargetClosedError",
+            "Error",
+            "Exception",
+            "BrowserError",
+            "TimeoutError",
+        }:
+            # Narrow by message: bare Exception is too wide, so require markers.
+            pass
+        message = str(error).lower()
+        markers = (
+            "epipe",
+            "broken pipe",
+            "target closed",
+            "browser has been closed",
+            "browser closed",
+            "connection closed",
+            "pipe closed",
+            "protocol error",
+            "websocket",
+            "playwright connection",
+            "chromium",
+            "browser.new_context",
+            "browser.new_page",
+        )
+        if any(marker in message for marker in markers):
+            return True
+        # Playwright TargetClosedError and driver disconnects.
+        return name in {"TargetClosedError", "BrowserClosedError"}
+
     async def start(self):
         async with self._lifecycle_lock:
-            if self._browser is not None:
-                is_connected = getattr(self._browser, "is_connected", None)
-                if not callable(is_connected) or is_connected():
-                    return
+            if self._browser_connected(self._browser):
+                return
+            if self._browser is not None or self._playwright is not None:
                 await self._close_unlocked()
             factory = self.playwright_factory
             if factory is None:
@@ -127,12 +365,18 @@ class PlaywrightExecutor:
         playwright = self._playwright
         self._browser = None
         self._playwright = None
+        # Never let Node EPIPE / closed-pipe errors escape cleanup.
         try:
             if browser is not None:
                 await self._close_transport_resource(browser.close())
+        except Exception:
+            pass
         finally:
-            if playwright is not None:
-                await self._close_transport_resource(playwright.stop())
+            try:
+                if playwright is not None:
+                    await self._close_transport_resource(playwright.stop())
+            except Exception:
+                pass
 
     @staticmethod
     def _consume_task_result(task):
@@ -141,7 +385,10 @@ class PlaywrightExecutor:
 
     @classmethod
     async def _close_transport_resource(cls, awaitable):
-        task = asyncio.create_task(awaitable)
+        try:
+            task = asyncio.create_task(awaitable)
+        except Exception:
+            return False
         try:
             done, _pending = await asyncio.wait(
                 {task}, timeout=cls.CLOSE_TIMEOUT_SECONDS
@@ -157,9 +404,11 @@ class PlaywrightExecutor:
         task.add_done_callback(cls._consume_task_result)
         return False
 
-    async def _recycle_browser(self, browser):
+    async def _recycle_browser(self, browser=None):
         async with self._lifecycle_lock:
-            if self._browser is browser:
+            if browser is None or self._browser is browser or not self._browser_connected(
+                self._browser
+            ):
                 await self._close_unlocked()
 
     async def __aenter__(self):
@@ -218,6 +467,68 @@ class PlaywrightExecutor:
                     await candidate.click()
                     return True
         return False
+
+    @classmethod
+    async def _submit_device_consent(cls, page, action="allow"):
+        """Approve/deny the device-consent form.
+
+        accounts.x.ai renders a POST form to auth.x.ai/oauth2/device/approve with a
+        hidden ``action`` input that starts empty. Client JS is supposed to stamp
+        ``allow``/``deny`` on click; under higher RTT (or before hydration) a bare
+        click can POST ``action=`` and the server replies plain ``Invalid action``.
+        Force the hidden field first, then click the visible control.
+        """
+        action = "allow" if str(action).lower() not in {"deny", "拒绝"} else "deny"
+        try:
+            await page.evaluate(
+                """(value) => {
+                    const forms = Array.from(document.querySelectorAll('form'));
+                    const form = forms.find((item) => {
+                        const target = (item.getAttribute('action') || item.action || '');
+                        return target.includes('device/approve') || target.includes('oauth2/device');
+                    }) || forms[0];
+                    if (!form) return false;
+                    let input = form.querySelector('input[name="action"]');
+                    if (!input) {
+                        input = document.createElement('input');
+                        input.type = 'hidden';
+                        input.name = 'action';
+                        form.appendChild(input);
+                    }
+                    input.value = value;
+                    return true;
+                }""",
+                action,
+            )
+        except Exception:
+            pass
+        labels = (
+            ("允许", "Allow", "Authorize", "Approve")
+            if action == "allow"
+            else ("拒绝", "Deny", "Cancel")
+        )
+        if await cls._click_visible_exact(page, labels):
+            return True
+        try:
+            submitted = await page.evaluate(
+                """() => {
+                    const forms = Array.from(document.querySelectorAll('form'));
+                    const form = forms.find((item) => {
+                        const target = (item.getAttribute('action') || item.action || '');
+                        return target.includes('device/approve') || target.includes('oauth2/device');
+                    }) || forms[0];
+                    if (!form) return false;
+                    if (typeof form.requestSubmit === 'function') {
+                        form.requestSubmit();
+                    } else {
+                        form.submit();
+                    }
+                    return true;
+                }"""
+            )
+            return bool(submitted)
+        except Exception:
+            return False
 
     @staticmethod
     async def _click_visible_turnstile(page):
@@ -298,9 +609,29 @@ class PlaywrightExecutor:
         return cookies
 
     async def confirm(self, source: SourceRecord, flow: DeviceFlow):
-        await self.start()
+        # Relaunch if previous account killed the Chromium / Node driver pipe.
+        for launch_try in range(2):
+            try:
+                await self.start()
+                break
+            except Exception as error:
+                if launch_try == 0 and self._is_transport_error(error):
+                    await self._recycle_browser()
+                    continue
+                return AuthorizationResult(
+                    AuthorizationStatus.NEEDS_INTERACTION, "browser_error"
+                )
         async with self._semaphore:
             browser = self._browser
+            if not self._browser_connected(browser):
+                await self._recycle_browser(browser)
+                try:
+                    await self.start()
+                except Exception:
+                    return AuthorizationResult(
+                        AuthorizationStatus.NEEDS_INTERACTION, "browser_error"
+                    )
+                browser = self._browser
             attempt = asyncio.create_task(
                 self._confirm_once(browser, source, flow)
             )
@@ -313,7 +644,16 @@ class PlaywrightExecutor:
                 attempt.add_done_callback(self._consume_task_result)
                 raise
             if attempt in done:
-                return attempt.result()
+                try:
+                    return attempt.result()
+                except Exception as error:
+                    # Dead browser / EPIPE from Node driver: recycle and soft-fail.
+                    if self._is_transport_error(error):
+                        await self._recycle_browser(browser)
+                        return AuthorizationResult(
+                            AuthorizationStatus.NEEDS_INTERACTION, "browser_error"
+                        )
+                    raise
 
             # A Playwright transport can swallow cancellation while one of its
             # RPCs is wedged.  Do not let asyncio.wait_for() extend the nominal
@@ -354,9 +694,21 @@ class PlaywrightExecutor:
                 ua = cached_user_agent()
                 if ua:
                     context_kwargs["user_agent"] = ua
+                # Per-attempt proxy rotation when PROXY_FILE / multi-proxy pool is set
+                pw_proxy, _assigned = next_playwright_proxy_settings()
+                if pw_proxy:
+                    context_kwargs["proxy"] = pw_proxy
                 context = await browser.new_context(**context_kwargs)
-                # CF cookies from external FlareSolverr prewarm (host-level)
+                # CF cookies from FlareSolverr when CLEARANCE_ENABLED=1.
+                try:
+                    from grok_register.clearance import clearance_enabled, prewarm_clearance
+
+                    if clearance_enabled():
+                        await asyncio.to_thread(prewarm_clearance)
+                except Exception:
+                    pass
                 await apply_clearance_to_context(context)
+
                 page = await context.new_page()
                 await self._install_request_filters(page)
                 await context.add_cookies(self._expanded_cookies(source))
@@ -435,6 +787,13 @@ class PlaywrightExecutor:
                         continue
 
                     if "invalid action" in text_lower:
+                        # Empty/missing consent action; retry once with forced field.
+                        if not consent_submitted:
+                            if await self._submit_device_consent(page, "allow"):
+                                consent_submitted = True
+                                unknown_since = None
+                                await page.wait_for_timeout(self.CONSENT_WAIT_MS)
+                                continue
                         return AuthorizationResult(
                             AuthorizationStatus.NEEDS_INTERACTION,
                             "consent_invalid_action",
@@ -445,23 +804,7 @@ class PlaywrightExecutor:
                         for marker in ("authorize grok build", "授权 grok build")
                     ):
                         if not consent_submitted:
-                            # accounts.x.ai consent form keeps action in a hidden
-                            # input filled by React click handlers. If hydration is
-                            # late, a bare submit posts action="" → "Invalid action".
-                            with suppress(Exception):
-                                await page.evaluate(
-                                    """() => {
-                                        const action = document.querySelector(
-                                          'input[name="action"]'
-                                        );
-                                        if (action) {
-                                          action.value = 'allow';
-                                        }
-                                    }"""
-                                )
-                            allowed = await self._click_visible_exact(
-                                page, ("允许", "Allow", "Authorize", "Approve")
-                            )
+                            allowed = await self._submit_device_consent(page, "allow")
                             if allowed:
                                 consent_submitted = True
                                 unknown_since = None
@@ -533,7 +876,14 @@ class PlaywrightExecutor:
                         for marker in (
                             "continue with email",
                             "sign in with email",
+                            "login with email",
+                            "log into your account",
+                            "log in to your account",
+                            "login with google",
+                            "login with apple",
                             "使用邮箱登录",
+                            "登录你的账户",
+                            "登录您的账户",
                         )
                     ) or await page.locator('input[type="password"]').count():
                         return AuthorizationResult(
@@ -607,9 +957,15 @@ class PlaywrightExecutor:
                 error.__class__.__name__ == "TimeoutError"
                 and error.__class__.__module__.startswith("playwright")
             )
+            if self._is_transport_error(error) or (
+                not is_timeout and "closed" in str(error).lower()
+            ):
+                # Signal outer confirm() to recycle the shared browser.
+                raise
             return AuthorizationResult(
                 AuthorizationStatus.NEEDS_INTERACTION,
                 "confirmation_timeout" if is_timeout else "browser_error",
             )
         finally:
-            await self._close_attempt_resources(page, context)
+            with suppress(Exception):
+                await self._close_attempt_resources(page, context)

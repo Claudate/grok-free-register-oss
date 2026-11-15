@@ -36,6 +36,46 @@ def test_ledger_recovers_pending_jobs(tmp_path):
     assert ledger.get(job_id)["status"] == JobStatus.CANCELLED.value
 
 
+def test_authorization_start_count_tracks_jobs_that_entered_authorization(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db", b"salt")
+    assert ledger.authorization_start_count() == 0
+    job_a = ledger.start("source-a", attempt=1)
+    job_b = ledger.start("source-b", attempt=1)
+    ledger.mark_authorization_started(job_a)
+    ledger.mark_authorization_started(job_b)
+    assert ledger.authorization_start_count() == 2
+    # Recovered/cancelled jobs still count so restart can continue task numbers.
+    ledger.recover_pending()
+    assert ledger.authorization_start_count() == 2
+
+
+def test_ensure_imported_is_idempotent_and_fills_inventory(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db", b"salt")
+    assert ledger.ensure_imported("user@example.test", "xai-abc") is True
+    assert ledger.ensure_imported("user@example.test", "xai-abc") is False
+    assert ledger.has_imported("user@example.test")
+    assert ledger.aggregate_counts()["imported_unique"] == 1
+    assert ledger.inventory_counts()["available"] == 1
+
+
+def test_ledger_retries_locked_operational_errors(tmp_path, monkeypatch):
+    ledger = Ledger(tmp_path / "ledger.db", b"salt")
+    calls = {"n": 0}
+    real_open = ledger._open_connection
+
+    def flaky_open():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return real_open()
+
+    ledger._reset_connection()
+    monkeypatch.setattr(ledger, "_open_connection", flaky_open)
+    job_id = ledger.start("source-retry", attempt=1)
+    assert job_id is not None
+    assert calls["n"] >= 3
+
+
 def test_ledger_backfills_imported_receipts_into_available_inventory(tmp_path):
     path = tmp_path / "ledger.db"
     with sqlite3.connect(path) as connection:

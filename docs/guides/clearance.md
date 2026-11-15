@@ -32,6 +32,7 @@ docker compose ps
 ```env
 REGISTER_PROXY=http://127.0.0.1:40080
 CLEARANCE_ENABLED=1
+CLEARANCE_REQUIRED=0
 FLARESOLVERR_URL=http://127.0.0.1:8191
 CLEARANCE_PROXY=http://privoxy:8118
 CLEARANCE_URLS=https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai
@@ -40,6 +41,7 @@ CLEARANCE_URLS=https://accounts.x.ai,https://x.ai,https://status.x.ai,https://co
 | 变量 | 归属 | 说明 |
 |---|---|---|
 | `REGISTER_PROXY` | 本进程 Playwright + httpx | 必须是**宿主机**可达地址 |
+| `CLEARANCE_REQUIRED` | 启动失败策略 | `0` 时预热失败只警告继续；`1` 时立即退出 |
 | `CLEARANCE_PROXY` | FS **容器内**浏览器 | 必须是 compose 网内名，如 `http://privoxy:8118`；勿填 `127.0.0.1` |
 | `FLARESOLVERR_URL` | 本进程调 FS API | 默认 `http://127.0.0.1:8191` |
 | `CLEARANCE_URLS` | 预热根域 | 默认五条 x.ai 家族根（无 path） |

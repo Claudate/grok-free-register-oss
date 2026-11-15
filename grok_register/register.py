@@ -1,4 +1,9 @@
 """
+[INPUT]: 依赖 Playwright、grok_register.clearance、core 库存/门控/观测模块与 Turnstile provider
+[OUTPUT]: 对外提供注册 CLI 主流程、配置抓取、S/P/C worker、注册结果持久化
+[POS]: grok_register 的注册流水线入口，协调清障、配置、token、邮箱验证码与最终注册
+[PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+
 Grok Free Register — CSP 异步并发架构
 =============================================
 单进程 asyncio + 单共享 CloakBrowser + Semaphore 背压:
@@ -37,8 +42,13 @@ from grok_register.clearance import (
     apply_clearance_to_context,
     cached_user_agent,
     format_prewarm_log,
+    get_proxy_pool,
+    mark_proxy_bad,
+    next_playwright_proxy_settings,
     playwright_proxy_settings,
     prewarm_clearance,
+    proxy_host_label,
+    proxy_pool_summary,
     register_proxy_url,
 )
 from grok_register import turnstile_provider as turnstile_provider_mod
@@ -190,7 +200,36 @@ def rand_str(n=15): return ''.join(random.choice(string.ascii_lowercase + string
 
 
 def sanitize_terminal_error(error):
-    return type(error).__name__
+    kind = type(error).__name__
+    detail = " ".join(str(error or "").split())
+    if not detail:
+        return kind
+
+    # 诊断要保留原因，但不能把代理密码、Cookie 或 JWT 打进日志。
+    detail = re.sub(
+        r"(?i)(https?://)([^/\s:@]+):([^@\s/]+)@",
+        r"\1<redacted>@",
+        detail,
+    )
+    detail = re.sub(
+        r"(?i)\b(authorization|cookie|sso(?:-rw)?|token|password|secret)\b"
+        r"\s*[:=]\s*[^;\s,]+",
+        r"\1=<redacted>",
+        detail,
+    )
+    detail = re.sub(
+        r"(?i)([?&](?:token|code|state|sso|password|secret)=)[^&\s]+",
+        r"\1<redacted>",
+        detail,
+    )
+    detail = re.sub(
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+        "<jwt-redacted>",
+        detail,
+    )
+    if len(detail) > 280:
+        detail = detail[:277] + "..."
+    return f"{kind}: {detail}"
 
 
 def format_user_registration_event(
@@ -224,6 +263,10 @@ def format_user_registration_event(
 
 class RegistrationRateLimited(RuntimeError):
     """注册提交被目标站点的限流页替代。"""
+
+
+class ConfigFetchError(ValueError):
+    """启动期无法从 sign-up 页抓到必需运行配置。"""
 
 
 class RegistrationRateLimitCircuit:
@@ -425,7 +468,31 @@ async def _get_http_client():
             from grok_register.http_protocol import XAIHttpClientPool
 
             def _build():
-                return XAIHttpClientPool(size=HTTP_POOL_SIZE)
+                # Multi-proxy: leave proxy=None so each slot can be built with
+                # a rotated URL inside the pool factory when supported; fallback
+                # to process default (first / single REGISTER_PROXY).
+                from grok_register.clearance import next_httpx_proxy, get_proxy_pool as _gpp
+
+                pool_size = HTTP_POOL_SIZE
+                pp = _gpp()
+                if pp.size > 1:
+                    # Build pool without fixed proxy; XAIHttpClientPool uses
+                    # register_proxy_url() per slot unless proxy= is set.
+                    # We pass proxy=None and monkey-patch via size-only; each
+                    # XAIHttpClient() reads register_proxy_url which is sticky
+                    # first — so build manually with rotated proxies.
+                    from grok_register.http_protocol import XAIHttpClientPool, XAIHttpClient
+
+                    class _RotatingHttpPool(XAIHttpClientPool):
+                        def _new_client(self):
+                            return XAIHttpClient(
+                                proxy=next_httpx_proxy(),
+                                impersonate=self._impersonate,
+                                user_agent=self._user_agent,
+                            )
+
+                    return _RotatingHttpPool(size=pool_size)
+                return XAIHttpClientPool(size=pool_size)
 
             _HTTP_CLIENT = await asyncio.to_thread(_build)
             debug_log(
@@ -477,28 +544,23 @@ def decode_jwt_payload(token):
     try: return json.loads(base64.urlsafe_b64decode(payload))
     except Exception: return None
 def find_chrome():
-    # Linux: ~/.cloakbrowser/chromium-*/chrome
-    # macOS: ~/.cloakbrowser/chromium-*/Chromium.app/Contents/MacOS/Chromium
-    patterns = [
-        os.path.expanduser("~/.cloakbrowser/chromium-*/chrome"),
-        os.path.expanduser("~/.cloakbrowser/chromium-*/Chromium.app/Contents/MacOS/Chromium"),
-        os.path.expanduser("~/.cloakbrowser/chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"),
-    ]
+    """Resolve CloakBrowser Chromium binary (Linux chrome or macOS Chromium.app)."""
+    home = os.path.expanduser("~/.cloakbrowser")
+    patterns = (
+        os.path.join(home, "chromium-*/chrome"),
+        os.path.join(home, "chromium-*/Chromium.app/Contents/MacOS/Chromium"),
+        os.path.join(home, "chromium-*/chrome-mac/Chromium.app/Contents/MacOS/Chromium"),
+    )
     paths = []
     for pattern in patterns:
         paths.extend(glob.glob(pattern))
-    # Prefer cloakbrowser API when available (handles layout drift).
-    try:
-        from cloakbrowser import ensure_binary
-        api_path = ensure_binary()
-        if api_path and os.path.isfile(api_path):
-            paths.append(api_path)
-    except Exception:
-        pass
-    paths = [p for p in paths if p and os.path.isfile(p)]
+    # Prefer real files that are executable
+    paths = [p for p in paths if os.path.isfile(p) and os.access(p, os.X_OK)]
     if not paths:
-        raise RuntimeError("CloakBrowser not found")
-    return sorted(set(paths))[-1]
+        raise RuntimeError(
+            "CloakBrowser not found. Run: .venv/bin/python -m cloakbrowser install"
+        )
+    return sorted(paths)[-1]
 
 
 def _read_cmdline(pid: int) -> str:
@@ -532,8 +594,16 @@ def reap_orphan_register_browsers(*, exclude_pids: set[int] | None = None) -> in
     exclude = set(exclude_pids or ())
     exclude.add(os.getpid())
     # 当前进程树：子进程先别杀，留给 browser.close
+    # Linux: ps --ppid; macOS/BSD: ps -o pid= -g <pgid> 不可靠，改用 pgrep -P
     try:
-        for line in os.popen(f"ps -o pid= --ppid {os.getpid()}").read().split():
+        import subprocess as _sp
+
+        out = _sp.check_output(
+            ["pgrep", "-P", str(os.getpid())],
+            stderr=_sp.DEVNULL,
+            text=True,
+        )
+        for line in out.split():
             try:
                 exclude.add(int(line))
             except ValueError:
@@ -542,26 +612,46 @@ def reap_orphan_register_browsers(*, exclude_pids: set[int] | None = None) -> in
         pass
 
     victims: list[int] = []
-    try:
-        for name in os.listdir("/proc"):
-            if not name.isdigit():
-                continue
-            pid = int(name)
-            if pid in exclude or pid <= 1:
-                continue
-            cmd = _read_cmdline(pid)
-            if not _is_cloakbrowser_chrome(cmd):
-                continue
-            # 跳过 docker cgroup（双保险）
-            try:
-                with open(f"/proc/{pid}/cgroup", "r", encoding="utf-8") as fh:
-                    if "docker" in fh.read():
-                        continue
-            except Exception:
-                pass
-            victims.append(pid)
-    except Exception:
-        return 0
+    # Linux: scan /proc. macOS 无 /proc，用 pgrep -f 找 cloakbrowser
+    if os.path.isdir("/proc"):
+        try:
+            for name in os.listdir("/proc"):
+                if not name.isdigit():
+                    continue
+                pid = int(name)
+                if pid in exclude or pid <= 1:
+                    continue
+                cmd = _read_cmdline(pid)
+                if not _is_cloakbrowser_chrome(cmd):
+                    continue
+                # 跳过 docker cgroup（双保险）
+                try:
+                    with open(f"/proc/{pid}/cgroup", "r", encoding="utf-8") as fh:
+                        if "docker" in fh.read():
+                            continue
+                except Exception:
+                    pass
+                victims.append(pid)
+        except Exception:
+            return 0
+    else:
+        try:
+            import subprocess as _sp
+
+            out = _sp.check_output(
+                ["pgrep", "-f", "cloakbrowser|/.cloakbrowser/"],
+                stderr=_sp.DEVNULL,
+                text=True,
+            )
+            for line in out.split():
+                try:
+                    pid = int(line)
+                except ValueError:
+                    continue
+                if pid not in exclude and pid > 1:
+                    victims.append(pid)
+        except Exception:
+            return 0
 
     if not victims:
         return 0
@@ -783,7 +873,11 @@ def derive_c_hot_page_pool_size(physical_cap, c_workers, configured_size=None):
 #  配置获取
 # ──────────────────────────────────────────────
 def _launch_options():
-    """Playwright chromium.launch kwargs. HTTP_PROXY/REGISTER_PROXY apply here (not to FlareSolverr)."""
+    """Playwright chromium.launch kwargs.
+
+    Single proxy → pin at launch. Multi-proxy pool → launch direct; each
+    context gets its own proxy via new_context(proxy=...).
+    """
     options = {"executable_path": find_chrome(), "headless": True}
     proxy = playwright_proxy_settings()
     if proxy:
@@ -791,22 +885,293 @@ def _launch_options():
     return options
 
 
-async def _prepare_browser_page(browser):
-    """new_page + inject prewarmed CF cookies into its context when available."""
-    page = await browser.new_page()
-    await apply_clearance_to_context(page.context)
-    return page
+def _is_proxy_error(exc: BaseException) -> bool:
+    msg = str(exc or "").lower()
+    needles = (
+        "err_proxy",
+        "err_tunnel",
+        "err_invalid_auth_credentials",
+        "proxy",
+        "tunnel connection failed",
+        "407",
+        "timed_out",
+        "timeout",
+        "net::err_",
+        "connection_refused",
+        "connection_reset",
+        "name_not_resolved",
+    )
+    return any(n in msg for n in needles)
 
 
-async def _prepare_browser_context(browser):
-    """new_context with optional FS user-agent + CF cookies."""
-    kwargs = {}
+async def _prepare_browser_context(browser, *, proxy_url: str | None = None):
+    """new_context with optional per-task proxy + FS user-agent + CF cookies.
+
+    Returns (context, assigned_proxy_url).
+    """
+    kwargs: dict = {}
     ua = cached_user_agent()
     if ua:
         kwargs["user_agent"] = ua
+    assigned = proxy_url if proxy_url is not None else ""
+    if proxy_url is None:
+        pw_proxy, assigned = next_playwright_proxy_settings()
+        if pw_proxy:
+            kwargs["proxy"] = pw_proxy
+    elif proxy_url:
+        from grok_register.clearance import proxy_url_to_playwright
+
+        pw_proxy = proxy_url_to_playwright(proxy_url)
+        if pw_proxy:
+            kwargs["proxy"] = pw_proxy
     context = await browser.new_context(**kwargs)
     await apply_clearance_to_context(context)
-    return context
+    return context, assigned
+
+
+async def _prepare_browser_page(browser, *, proxy_url: str | None = None):
+    """new_page in a fresh context (per-task proxy) + CF cookies.
+
+    Returns page; proxy URL is stashed on page._csp_proxy_url for mark_bad.
+    """
+    context, assigned = await _prepare_browser_context(browser, proxy_url=proxy_url)
+    page = await context.new_page()
+    try:
+        page._csp_proxy_url = assigned  # type: ignore[attr-defined]
+        page._csp_owned_context = context  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return page
+
+
+async def _close_browser_page(page) -> None:
+    """Close page and its owned context (if we created one for proxy isolation)."""
+    if page is None:
+        return
+    context = getattr(page, "_csp_owned_context", None)
+    try:
+        await page.close()
+    except Exception:
+        pass
+    if context is not None:
+        try:
+            await context.close()
+        except Exception:
+            pass
+
+
+def _note_proxy_failure(page_or_url, exc: BaseException | None = None) -> None:
+    """Mark proxy bad when navigation / tunnel errors look proxy-related."""
+    if isinstance(page_or_url, str):
+        url = page_or_url
+    else:
+        url = getattr(page_or_url, "_csp_proxy_url", "") or ""
+    if not url:
+        return
+    if exc is not None and not _is_proxy_error(exc):
+        return
+    mark_proxy_bad(url, reason=str(exc or "fail")[:80])
+    debug_log(f"[proxy] mark_bad {proxy_host_label(url)} ({proxy_pool_summary()})")
+
+
+def _missing_signup_config_fields() -> list[str]:
+    return [
+        name
+        for name, value in (
+            ("SITE_KEY", SITE_KEY),
+            ("ACTION_ID", ACTION_ID),
+            ("STATE_TREE", STATE_TREE),
+        )
+        if not value
+    ]
+
+
+async def _summarize_signup_page(page) -> str:
+    """Return a bounded, secret-free classification of the last page."""
+    if page is None:
+        return "page=none"
+
+    url = str(getattr(page, "url", "") or "unknown")
+    title = ""
+    body = ""
+    try:
+        source = await page.content()
+        title_match = re.search(
+            r"<title[^>]*>(.*?)</title>",
+            source,
+            re.IGNORECASE | re.DOTALL,
+        )
+        title = " ".join((title_match.group(1) if title_match else "").split())
+        body = re.sub(r"<[^>]+>", " ", source)
+        body = " ".join(body.split())
+    except Exception:
+        pass
+
+    haystack = f"{title} {body}".lower()
+    if any(
+        marker in haystack
+        for marker in (
+            "just a moment",
+            "checking your browser",
+            "challenge-platform",
+            "cf-chl-",
+            "cloudflare",
+        )
+    ):
+        marker = "cloudflare_challenge"
+    elif any(marker in haystack for marker in ("access denied", "forbidden", "error 403")):
+        marker = "access_denied"
+    elif "sign up" in haystack or "create your account" in haystack:
+        marker = "signup_page"
+    else:
+        marker = "unexpected_page"
+
+    parts = [
+        f"url={sanitize_terminal_error(ValueError(url)).split(': ', 1)[-1]}",
+        f"marker={marker}",
+        f"missing={','.join(_missing_signup_config_fields()) or 'none'}",
+    ]
+    if title:
+        parts.insert(1, f"title={sanitize_terminal_error(ValueError(title)).split(': ', 1)[-1]}")
+    return " ".join(parts)
+
+
+def _format_config_fetch_failure(attempts, last_error=None, page_summary=""):
+    missing = ",".join(_missing_signup_config_fields()) or "none"
+    detail = sanitize_terminal_error(last_error) if last_error else "unknown"
+    clearance = os.environ.get("CLEARANCE_ENABLED", "0").strip().lower()
+    clearance_state = "enabled" if clearance in ("1", "true", "yes") else "disabled"
+    proxy = register_proxy_url()
+    egress = proxy_host_label(proxy) if proxy else "direct"
+    hint = _config_fetch_hint(page_summary, clearance_state)
+    parts = [
+        f"missing={missing}",
+        f"attempts={attempts}",
+        f"last={detail}",
+        f"page={page_summary or 'unknown'}",
+        f"clearance={clearance_state}",
+        f"egress={egress}",
+    ]
+    if hint:
+        parts.append(f"hint={hint}")
+    return (
+        "Config fetch failed: "
+        + "; ".join(parts)
+        + "."
+    )
+
+
+def _config_fetch_hint(page_summary: str, clearance_state: str) -> str:
+    """把页面分类翻译成操作员能执行的修复动作。"""
+    summary = (page_summary or "").lower()
+    if "marker=cloudflare_challenge" not in summary:
+        return "run with --debug and verify the configured egress before retrying"
+    if clearance_state == "disabled":
+        return (
+            "Cloudflare challenge detected while CLEARANCE_ENABLED=0; "
+            "start clearance stack and set CLEARANCE_ENABLED=1, "
+            "FLARESOLVERR_URL, CLEARANCE_URLS, CLEARANCE_PROXY, REGISTER_PROXY"
+        )
+    return (
+        "Cloudflare challenge remained after clearance prewarm; verify "
+        "FlareSolverr returns cf+ and CLEARANCE_PROXY/REGISTER_PROXY use the same egress"
+    )
+
+
+def _format_clearance_prewarm_failure(result) -> str:
+    """清障失败时在启动浏览器前给出可执行的配置错误。"""
+    if not result or not result.get("enabled"):
+        return ""
+
+    cookies = int(result.get("cookies") or 0)
+    detail_rows = result.get("detail") or []
+    has_cf_clearance = any(
+        isinstance(row, dict) and row.get("cf_clearance")
+        for row in detail_rows
+    )
+    if result.get("cached") and cookies:
+        return ""
+    if result.get("ok") and has_cf_clearance:
+        return ""
+
+    errors = result.get("errors") or []
+    details = []
+    for error in errors[:3]:
+        rendered = sanitize_terminal_error(RuntimeError(str(error)))
+        details.append(rendered.split(": ", 1)[-1])
+    detail = " | ".join(details)
+    if not detail:
+        detail = "FlareSolverr returned no cf_clearance cookie"
+    fs_url = result.get("flaresolverr") or os.environ.get(
+        "FLARESOLVERR_URL", "http://127.0.0.1:8191"
+    )
+    return (
+        f"Clearance prewarm failed: fs={fs_url}; error={detail}; "
+        "verify FLARESOLVERR_URL, or set CLEARANCE_REQUIRED=1 to fail fast; "
+        "keep CLEARANCE_PROXY/REGISTER_PROXY on the same egress when clearance is required."
+    )
+
+
+def _clearance_required() -> bool:
+    """是否把 clearance 预热失败视为启动阻断。"""
+    return str(os.environ.get("CLEARANCE_REQUIRED") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _next_static_js_urls(html: str) -> list[str]:
+    """提取 Next 静态 JS；当前资源 URL 会带 ?dpl= 版本参数。"""
+    return re.findall(r'src="(/_next/static/[^"]+\.js(?:\?[^"]*)?)"', html or "")
+
+
+async def _scrape_signup_config_from_page(page) -> None:
+    """Fill SITE_KEY / ACTION_ID / STATE_TREE from a loaded sign-up page."""
+    global SITE_KEY, ACTION_ID, STATE_TREE
+    html = await page.content()
+    m = re.search(r'0x4AAAAAAA[a-zA-Z0-9_-]+', html)
+    if m:
+        SITE_KEY = m.group(0)
+        debug_log(f'[+] SITE_KEY: {SITE_KEY}')
+    for chunk in re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL):
+        if 'sign-up' not in chunk:
+            continue
+        decoded = chunk.replace('\\"', '"')
+        f_match = re.search(r'"f":\[\[\[', decoded)
+        if not f_match:
+            continue
+        f_start = f_match.start() + 5
+        end_idx = decoded.find('"$undefined"', f_start)
+        if end_idx < 0:
+            continue
+        STATE_TREE = quote(
+            decoded[f_start:end_idx].replace('\\\\"', '"').replace('\\', ''),
+            safe='',
+        )
+        debug_log(f'[+] STATE_TREE: {STATE_TREE[:50]}...')
+        break
+    js_urls = _next_static_js_urls(html)
+    for js_url in js_urls[:50]:
+        try:
+            js = await page.evaluate(
+                f"(async()=>{{return await fetch('{js_url}').then(r=>r.text()).catch(()=>\"\" )}})()"
+            )
+            if not js:
+                continue
+            if not any(kw in js for kw in ['createUser', 'registerUser', 'emailValidation']):
+                continue
+            hexes = re.findall(r'[a-fA-F0-9]{40,50}', js)
+            if hexes:
+                ACTION_ID = hexes[0]
+                break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+    if ACTION_ID:
+        debug_log(f'[+] ACTION_ID: {ACTION_ID}')
 
 
 async def fetch_config():
@@ -841,66 +1206,68 @@ async def fetch_config():
         except Exception as exc:
             debug_log(f'[*] HTTP config err: {sanitize_terminal_error(exc)}; browser fallback')
 
+    # Multi-proxy overnight: try several proxies before hard-failing config.
+    proxy_pool = get_proxy_pool()
+    max_attempts = max(1, min(8, proxy_pool.size or 1))
+    last_err: BaseException | None = None
+    last_page_summary = ""
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**_launch_options())
         try:
-            page = await _prepare_browser_page(browser)
-            # Prefer domcontentloaded: CF/xAI signup often never reaches full 'load'.
-            config_goto_timeout_ms = int(os.environ.get("CONFIG_GOTO_TIMEOUT_MS", "60000") or "60000")
-            await page.goto(
-                f'{SITE_URL}/sign-up?redirect=grok-com',
-                timeout=config_goto_timeout_ms,
-                wait_until=PAGE_GOTO_WAIT_UNTIL,
-            )
-            await page.wait_for_timeout(int(os.environ.get("CONFIG_GOTO_SETTLE_MS", "5000") or "5000"))
-            html = await page.content()
-            m = re.search(r'0x4AAAAAAA[a-zA-Z0-9_-]+', html)
-            if m: SITE_KEY = m.group(0); debug_log(f'[+] SITE_KEY: {SITE_KEY}')
-            for chunk in re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL):
-                if 'sign-up' not in chunk: continue
-                decoded = chunk.replace('\\"', '"')
-                f_match = re.search(r'"f":\[\[\[', decoded)
-                if not f_match: continue
-                f_start = f_match.start() + 5
-                end_idx = decoded.find('"$undefined"', f_start)
-                if end_idx < 0: continue
-                STATE_TREE = quote(decoded[f_start:end_idx].replace('\\\\"', '"').replace('\\', ''), safe='')
-                debug_log(f'[+] STATE_TREE: {STATE_TREE[:50]}...')
-                break
-            js_urls = re.findall(r'src="(/_next/static/[^"]+\.js)"', html)
-            for js_url in js_urls[:50]:
+            for attempt in range(1, max_attempts + 1):
+                page = None
                 try:
-                    js = await page.evaluate(f"(async()=>{{return await fetch('{js_url}').then(r=>r.text()).catch(()=>\"\" )}})()")
-                    if not js: continue
-                    if not any(kw in js for kw in ['createUser','registerUser','emailValidation']): continue
-                    hexes = re.findall(r'[a-fA-F0-9]{40,50}', js)
-                    if hexes: ACTION_ID = hexes[0]; break
+                    page = await _prepare_browser_page(browser)
+                    proxy_url = getattr(page, "_csp_proxy_url", "") or ""
+                    if proxy_url:
+                        debug_log(
+                            f'[*] config via proxy {proxy_host_label(proxy_url)} '
+                            f'({attempt}/{max_attempts})'
+                        )
+                    # Default Playwright wait is "load"; through residential proxies CF/x.ai
+                    # often never fire full load. Match _prepare_signup_page (domcontentloaded).
+                    await page.goto(
+                        f'{SITE_URL}/sign-up?redirect=grok-com',
+                        timeout=45000,
+                        wait_until=PAGE_GOTO_WAIT_UNTIL,
+                    )
+                    await page.wait_for_timeout(5000)
+                    await _scrape_signup_config_from_page(page)
+                    if all([SITE_KEY, ACTION_ID, STATE_TREE]):
+                        return
+                    # Incomplete page (CF challenge etc.) — treat as soft proxy fail
+                    last_page_summary = await _summarize_signup_page(page)
+                    debug_log(f"[*] config incomplete: {last_page_summary}")
+                    if proxy_url:
+                        mark_proxy_bad(proxy_url, reason="config_incomplete")
+                        debug_log(
+                            f'[proxy] mark_bad {proxy_host_label(proxy_url)} '
+                            f'config_incomplete ({proxy_pool_summary()})'
+                        )
+                    last_err = RuntimeError("Config incomplete on page")
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    continue
-            if ACTION_ID: debug_log(f'[+] ACTION_ID: {ACTION_ID}')
+                except Exception as exc:
+                    last_err = exc
+                    last_page_summary = await _summarize_signup_page(page)
+                    _note_proxy_failure(page, exc)
+                    debug_log(
+                        f'[*] config attempt {attempt}/{max_attempts} failed: '
+                        f'{sanitize_terminal_error(exc)}; {last_page_summary}'
+                    )
+                finally:
+                    await _close_browser_page(page)
         finally:
             await _close_browser_hard(browser, timeout=5.0)
+
     if not all([SITE_KEY, ACTION_ID, STATE_TREE]):
-        missing = [
-            name
-            for name, value in (
-                ("SITE_KEY", SITE_KEY),
-                ("ACTION_ID", ACTION_ID),
-                ("STATE_TREE", STATE_TREE),
+        raise ConfigFetchError(
+            _format_config_fetch_failure(
+                max_attempts,
+                last_error=last_err,
+                page_summary=last_page_summary,
             )
-            if not value
-        ]
-        proxy = register_proxy_url() or "(direct)"
-        raise RuntimeError(
-            "Config fetch failed: missing "
-            + ", ".join(missing)
-            + f"; url={SITE_URL}/sign-up proxy={proxy}. "
-            "Usually CF/network blocks signup page scrape. "
-            "Try: bash start.sh --debug; set REGISTER_PROXY; "
-            "enable CLEARANCE_ENABLED=1 + FlareSolverr; "
-            "or verify CloakBrowser can open accounts.x.ai."
         )
 
 
@@ -1035,7 +1402,16 @@ async def server_action_register(
             )
         if "rate_limited" in (result.markers or ""):
             raise RegistrationRateLimited("signup_rate_limited")
-        if not result.sso:
+        # Pool-slot leftover SSO must never count as a new registration.
+        # http_protocol no longer emits sso_source=jar; keep the gate as belt.
+        src = str(getattr(result, "sso_source", "") or "")
+        if src == "jar":
+            debug_log(
+                f"[C] signup HTTP rejected polluted jar sso "
+                f"src={src!r} markers={result.markers}"
+            )
+            return None
+        if not result.sso or not result.ok:
             return None
         if include_session:
             # HTTP jar: only sso value is reliable; sso-rw may or may not land
@@ -1299,7 +1675,11 @@ async def _get_solver_page(browser):
     p = await _prepare_browser_page(browser)
     await p.set_viewport_size({"width": 800, "height": 600})
     goto_started = time.time()
-    await p.goto(f'{SITE_URL}/sign-up', timeout=20000)
+    await p.goto(
+        f'{SITE_URL}/sign-up',
+        timeout=30000,
+        wait_until=PAGE_GOTO_WAIT_UNTIL,
+    )
     await p.wait_for_timeout(1000)
     return {"page": p, "n": 0, "reused": False, "goto_s": time.time() - goto_started}
 
@@ -1326,12 +1706,25 @@ async def _put_solver_page(item, ok):
 async def _close_solver_page(item):
     """Bound cleanup so a wedged renderer cannot trap the worker in finally."""
     page = item["page"]
+    context = getattr(page, "_csp_owned_context", None)
+
+    async def _close_once():
+        try:
+            await page.close()
+        except Exception:
+            pass
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+
     try:
-        await asyncio.wait_for(page.close(), timeout=SOLVER_CLEANUP_TIMEOUT)
+        await asyncio.wait_for(_close_once(), timeout=SOLVER_CLEANUP_TIMEOUT)
     except asyncio.CancelledError:
         # Solver cancellation is expected at the hard deadline.  Give cleanup
         # its own bounded task so the page is not returned to the reuse pool.
-        cleanup = asyncio.create_task(page.close())
+        cleanup = asyncio.create_task(_close_once())
         try:
             await asyncio.wait_for(cleanup, timeout=SOLVER_CLEANUP_TIMEOUT)
         except BaseException:
@@ -1975,7 +2368,8 @@ async def _send_q_request_batch(browser, physical_sem, p_send_sem, requests, met
                 metrics.p_page_prepare_seconds += time.time() - stage_started
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            _note_proxy_failure(page, exc)
             return [{**item, "sent": False} for item in requests]
 
         results = []
@@ -1986,7 +2380,8 @@ async def _send_q_request_batch(browser, physical_sem, p_send_sem, requests, met
                 sent = await grpc_create_code(page, item["email"])
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                _note_proxy_failure(page, exc)
                 sent = False
             results.append({**item, "sent": sent})
         if metrics is not None:
@@ -1995,10 +2390,7 @@ async def _send_q_request_batch(browser, physical_sem, p_send_sem, requests, met
         return results
     finally:
         if page is not None:
-            try:
-                await page.close()
-            except Exception:
-                pass
+            await _close_browser_page(page)
         if physical_acquired:
             if metrics is not None and physical_hold_started is not None:
                 metrics.p_physical_hold_seconds += time.time() - physical_hold_started
@@ -2119,10 +2511,22 @@ _c_hot_page_pool_size = derive_c_hot_page_pool_size(PHYSICAL_CAP or 1, C_WORKERS
 
 
 async def _new_c_hot_page(browser):
-    context = await _prepare_browser_context(browser)
+    context, assigned = await _prepare_browser_context(browser)
     page = await context.new_page()
+    try:
+        page._csp_proxy_url = assigned  # type: ignore[attr-defined]
+    except Exception:
+        pass
     await page.set_viewport_size({"width": 800, "height": 600})
-    await _prepare_signup_page(page, redirect=True, timeout=30000)
+    try:
+        await _prepare_signup_page(page, redirect=True, timeout=30000)
+    except Exception as exc:
+        _note_proxy_failure(page, exc)
+        try:
+            await context.close()
+        except Exception:
+            pass
+        raise
     return context, page
 
 
@@ -2139,16 +2543,22 @@ async def _acquire_c_page(browser, metrics=None):
 
     page = await _prepare_browser_page(browser)
     await page.set_viewport_size({"width": 800, "height": 600})
-    await _prepare_signup_page(page, redirect=True, timeout=30000)
-    return None, page
+    try:
+        await _prepare_signup_page(page, redirect=True, timeout=30000)
+    except Exception as exc:
+        _note_proxy_failure(page, exc)
+        await _close_browser_page(page)
+        raise
+    # Owned context lives on page; lease path expects (context, page)
+    return getattr(page, "_csp_owned_context", None), page
 
 
 async def _release_c_page(context, page, *, healthy):
-    if not C_HOT_PAGE_POOL or context is None:
-        try:
-            await page.close()
-        except Exception:
-            pass
+    owned = getattr(page, "_csp_owned_context", None) if page is not None else None
+    ctx = context if context is not None else owned
+
+    if not C_HOT_PAGE_POOL or ctx is None:
+        await _close_browser_page(page)
         return
 
     if healthy:
@@ -2156,17 +2566,17 @@ async def _release_c_page(context, page, *, healthy):
             if "/sign-up" not in (getattr(page, "url", "") or ""):
                 healthy = False
             else:
-                await context.clear_cookies()
+                await ctx.clear_cookies()
                 await page.evaluate(
                     "() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} }"
                 )
                 async with _c_hot_page_lock:
                     if len(_c_hot_page_pool) < _c_hot_page_pool_size:
-                        _c_hot_page_pool.append((context, page))
+                        _c_hot_page_pool.append((ctx, page))
                         return
         except asyncio.CancelledError:
             try:
-                await context.close()
+                await ctx.close()
             except Exception:
                 pass
             raise
@@ -2174,10 +2584,11 @@ async def _release_c_page(context, page, *, healthy):
             pass
 
     try:
-        await context.close()
+        await ctx.close()
     except Exception:
         try:
-            await page.close()
+            if page is not None:
+                await page.close()
         except Exception:
             pass
 
@@ -2417,7 +2828,76 @@ def _append_registration_line(path, line, mode=None, *, durable=False):
         os.chmod(path, mode)
 
 
+def _sso_session_id(sso: str) -> str:
+    """Extract session_id claim from an x.ai SSO JWT (empty if undecodable)."""
+    payload = decode_jwt_payload(sso or "")
+    if not isinstance(payload, dict):
+        return ""
+    sid = payload.get("session_id") or payload.get("sid") or payload.get("sub") or ""
+    return str(sid).strip()
+
+
+def _auth_sessions_known_ids(path: str = "keys/auth-sessions.jsonl") -> set[str]:
+    """session_id values already on disk (best-effort scan)."""
+    known: set[str] = set()
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                cookies = row.get("cookies") if isinstance(row, dict) else None
+                if not isinstance(cookies, list):
+                    continue
+                for cookie in cookies:
+                    if not isinstance(cookie, dict):
+                        continue
+                    if str(cookie.get("name") or "") != "sso":
+                        continue
+                    sid = _sso_session_id(str(cookie.get("value") or ""))
+                    if sid:
+                        known.add(sid)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return known
+
+
+# Process-local set of session_ids written this run (supplements disk scan).
+_PERSISTED_SESSION_IDS: set[str] = set()
+
+
 def _persist_registration(email, password, sso, session_cookies):
+    """Append registration artifacts, skipping duplicate SSO session_ids.
+
+    HTTP pool jar reuse used to write hundreds of emails against a handful of
+    real session JWTs. Dedup by JWT ``session_id`` so a polluted sso cannot
+    inflate auth-sessions / accounts / grok.txt again.
+    """
+    global _PERSISTED_SESSION_IDS
+    sid = _sso_session_id(sso or "")
+    if sid:
+        if sid in _PERSISTED_SESSION_IDS:
+            debug_log(
+                f"[persist] skip duplicate session_id={sid[:12]}… email={email}"
+            )
+            return
+        # Cold start / multi-worker: also refuse if already on disk.
+        if sid not in _PERSISTED_SESSION_IDS:
+            known = _auth_sessions_known_ids()
+            _PERSISTED_SESSION_IDS |= known
+            if sid in _PERSISTED_SESSION_IDS:
+                debug_log(
+                    f"[persist] skip disk-duplicate session_id={sid[:12]}… "
+                    f"email={email}"
+                )
+                return
+
     if session_cookies:
         document = json.dumps(
             {"email": email, "cookies": session_cookies},
@@ -2431,6 +2911,8 @@ def _persist_registration(email, password, sso, session_cookies):
         )
     _append_registration_line("keys/accounts.txt", f"{email}:{password}:{sso}\n")
     _append_registration_line("keys/grok.txt", sso + "\n")
+    if sid:
+        _PERSISTED_SESSION_IDS.add(sid)
 
 
 async def _consume_pair(
@@ -2741,8 +3223,16 @@ async def main():
     )
     if TARGET:
         debug_log(f"  Target: {TARGET}")
-    reg_proxy = register_proxy_url() or "(direct)"
-    debug_log(f"  RegisterProxy: {reg_proxy}")
+    pool = get_proxy_pool()
+    if pool.size == 0:
+        debug_log("  RegisterProxy: (direct)")
+    elif pool.size == 1:
+        debug_log(f"  RegisterProxy: {proxy_host_label(pool.all_urls()[0])} (single)")
+    else:
+        debug_log(
+            f"  RegisterProxyPool: {proxy_pool_summary()} "
+            f"(per-context rotate; first={proxy_host_label(pool.all_urls()[0])})"
+        )
     debug_log("=" * 50)
 
     # 上次异常退出可能残留 CloakBrowser；先收尸再 launch，避免叠 3–4 份吃光内存
@@ -2753,12 +3243,22 @@ async def main():
     # CF prewarm via external FlareSolverr (:8191) — separate from REGISTER_PROXY egress
     prewarm = await asyncio.to_thread(prewarm_clearance)
     log(format_prewarm_log(prewarm))
+    clearance_error = _format_clearance_prewarm_failure(prewarm)
+    if clearance_error:
+        if _clearance_required():
+            raise ConfigFetchError(clearance_error)
+        log(f"[!] 清障预热失败，已继续启动：{clearance_error}")
 
     await fetch_config()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**_launch_options())
-        debug_log(f'[*] Browser launched (proxy={reg_proxy})')
+        pool = get_proxy_pool()
+        if pool.size <= 1:
+            label = proxy_host_label(register_proxy_url()) if register_proxy_url() else "direct"
+            debug_log(f'[*] Browser launched (proxy={label})')
+        else:
+            debug_log(f'[*] Browser launched (proxy=per-context pool {proxy_pool_summary()})')
 
         # CSP 组件
         metrics = Metrics()

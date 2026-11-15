@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import threading
 import time
 import urllib.error
@@ -83,7 +84,8 @@ def clearance_timeout_sec() -> int:
 
 
 def clearance_refresh_sec() -> int:
-    return max(60, _env_int("CLEARANCE_REFRESH_SEC", 3000))
+    # Floor 15s so SS-pool auth can re-mint under 60s rotate (CLEARANCE_REFRESH_SEC=50).
+    return max(15, _env_int("CLEARANCE_REFRESH_SEC", 3000))
 
 
 def clearance_urls() -> list[str]:
@@ -113,13 +115,183 @@ def clearance_urls() -> list[str]:
     return out or list(DEFAULT_CLEARANCE_URLS)
 
 
+# ---------------------------------------------------------------------------
+# Register egress proxy pool
+#   PROXY_FILE          one URL per line (full pool, rotate per task)
+#   REGISTER_PROXY_LIST comma/newline separated list (same as file)
+#   REGISTER_PROXY      single proxy (also HTTPS_PROXY / HTTP_PROXY / ALL_PROXY)
+#   PROXY_STRATEGY      round_robin (default) | random
+# ---------------------------------------------------------------------------
+
+
+def _normalize_proxy_line(raw: str) -> str:
+    line = (raw or "").strip()
+    if not line or line.startswith("#"):
+        return ""
+    # allow "ip:port:user:pass" → http://user:pass@ip:port
+    if "://" not in line and line.count(":") >= 3:
+        parts = line.split(":")
+        host, port, user, password = parts[0], parts[1], parts[2], ":".join(parts[3:])
+        if host and port.isdigit() and user:
+            return f"http://{user}:{password}@{host}:{port}"
+    return line
+
+
+def load_proxy_urls_from_env() -> list[str]:
+    """Collect proxy URLs from PROXY_FILE / REGISTER_PROXY_LIST / REGISTER_PROXY…"""
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(item: str) -> None:
+        url = _normalize_proxy_line(item)
+        if not url or url in seen:
+            return
+        seen.add(url)
+        urls.append(url)
+
+    proxy_file = (os.environ.get("PROXY_FILE") or "").strip()
+    if proxy_file:
+        try:
+            with open(proxy_file, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    _add(line)
+        except OSError:
+            pass
+
+    list_raw = (os.environ.get("REGISTER_PROXY_LIST") or "").strip()
+    if list_raw:
+        for part in list_raw.replace("\n", ",").split(","):
+            _add(part)
+
+    if not urls:
+        for key in ("REGISTER_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+            value = (os.environ.get(key) or "").strip()
+            if value:
+                _add(value)
+                break
+    return urls
+
+
+def proxy_host_label(url: str) -> str:
+    """Safe label for logs (host:port only, no credentials)."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "?"
+        port = parsed.port
+        return f"{host}:{port}" if port else host
+    except Exception:
+        return "(proxy)"
+
+
+class ProxyPool:
+    """Thread-safe proxy list with rotation and bad-proxy quarantine."""
+
+    def __init__(self, urls: list[str], strategy: str = "round_robin"):
+        self._urls = list(urls)
+        self._strategy = (strategy or "round_robin").strip().lower()
+        self._lock = threading.RLock()
+        self._idx = 0
+        self._bad: dict[str, float] = {}  # url → quarantine until monotonic ts
+        self._bad_ttl = max(30, int(os.environ.get("PROXY_BAD_TTL_SEC") or "300"))
+
+    @property
+    def size(self) -> int:
+        return len(self._urls)
+
+    def all_urls(self) -> list[str]:
+        return list(self._urls)
+
+    def _purge_expired_locked(self, now: float) -> None:
+        expired = [u for u, until in self._bad.items() if until <= now]
+        for u in expired:
+            del self._bad[u]
+
+    def available(self) -> list[str]:
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired_locked(now)
+            good = [u for u in self._urls if u not in self._bad]
+            return good if good else list(self._urls)
+
+    def next(self) -> str:
+        """Return next proxy URL (empty if pool empty)."""
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired_locked(now)
+            candidates = [u for u in self._urls if u not in self._bad]
+            if not candidates:
+                candidates = list(self._urls)
+            if not candidates:
+                return ""
+            if self._strategy == "random":
+                return random.choice(candidates)
+            # round_robin over full list but skip bad when possible
+            n = len(self._urls)
+            for _ in range(n):
+                url = self._urls[self._idx % n]
+                self._idx += 1
+                if url not in self._bad or not candidates:
+                    return url
+            return candidates[0]
+
+    def mark_bad(self, url: str, *, reason: str = "") -> None:
+        if not url:
+            return
+        with self._lock:
+            self._bad[url] = time.monotonic() + self._bad_ttl
+
+    def bad_count(self) -> int:
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired_locked(now)
+            return len(self._bad)
+
+    def summary(self) -> str:
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired_locked(now)
+            bad_n = len(self._bad)
+            return f"size={len(self._urls)} bad={bad_n} strategy={self._strategy}"
+
+
+_proxy_pool: ProxyPool | None = None
+_proxy_pool_lock = threading.Lock()
+
+
+def reset_proxy_pool() -> None:
+    """Test helper: drop cached pool so next get reloads env."""
+    global _proxy_pool
+    with _proxy_pool_lock:
+        _proxy_pool = None
+
+
+def get_proxy_pool() -> ProxyPool:
+    global _proxy_pool
+    with _proxy_pool_lock:
+        if _proxy_pool is None:
+            strategy = (os.environ.get("PROXY_STRATEGY") or "round_robin").strip().lower()
+            _proxy_pool = ProxyPool(load_proxy_urls_from_env(), strategy=strategy)
+        return _proxy_pool
+
+
 def register_proxy_url() -> str:
-    """Egress proxy for *this* process (Playwright / httpx)."""
-    for key in ("REGISTER_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
-        value = (os.environ.get(key) or "").strip()
-        if value:
-            return value
-    return ""
+    """Default / sticky proxy for process-level use (first in pool, or empty)."""
+    pool = get_proxy_pool()
+    urls = pool.all_urls()
+    return urls[0] if urls else ""
+
+
+def next_register_proxy_url() -> str:
+    """Rotate: next egress proxy for a new browser context / HTTP slot."""
+    return get_proxy_pool().next()
+
+
+def mark_proxy_bad(url: str, *, reason: str = "") -> None:
+    get_proxy_pool().mark_bad(url, reason=reason)
+
+
+def proxy_pool_summary() -> str:
+    return get_proxy_pool().summary()
 
 
 def clearance_proxy_url() -> str:
@@ -133,33 +305,59 @@ def clearance_proxy_url() -> str:
     return ""
 
 
-def playwright_proxy_settings() -> dict[str, str] | None:
-    """Playwright launch/context proxy dict, or None for direct.
-
-    Chromium often rejects user:pass embedded in server URL with
-    net::ERR_INVALID_AUTH_CREDENTIALS. Split credentials into
-    username/password fields instead.
-    """
-    url = register_proxy_url()
+def proxy_url_to_playwright(url: str) -> dict[str, str] | None:
+    """Playwright launch/context proxy dict from a full proxy URL."""
     if not url:
         return None
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.hostname:
-        # Non-URL form; pass through and let Playwright report errors.
+    try:
+        parsed = urlparse(url)
+    except Exception:
         return {"server": url}
+    if not parsed.scheme or not parsed.hostname:
+        return {"server": url}
+    host = parsed.hostname
     port = f":{parsed.port}" if parsed.port else ""
-    server = f"{parsed.scheme}://{parsed.hostname}{port}"
+    server = f"{parsed.scheme}://{host}{port}"
     settings: dict[str, str] = {"server": server}
     if parsed.username is not None:
-        # urlparse keeps percent-encoding; unquote for real credentials.
         settings["username"] = unquote(parsed.username)
         settings["password"] = unquote(parsed.password or "")
     return settings
 
 
+def playwright_proxy_settings(url: str | None = None) -> dict[str, str] | None:
+    """Playwright proxy dict.
+
+    - url given → that proxy
+    - else if pool size == 1 → that one (safe for launch)
+    - else if pool size > 1 → None at launch (per-context rotation via next_*)
+    - empty pool → None (direct)
+    """
+    if url is not None:
+        return proxy_url_to_playwright(url)
+    pool = get_proxy_pool()
+    if pool.size == 0:
+        return None
+    if pool.size == 1:
+        return proxy_url_to_playwright(pool.all_urls()[0])
+    # Multi-proxy: do not pin launch; contexts call next_playwright_proxy_settings()
+    return None
+
+
+def next_playwright_proxy_settings() -> tuple[dict[str, str] | None, str]:
+    """(playwright_proxy_dict_or_None, proxy_url) for a new context."""
+    url = next_register_proxy_url()
+    return proxy_url_to_playwright(url), url
+
+
 def httpx_proxy_mounts() -> str | None:
     """Single proxy URL for httpx.AsyncClient(proxy=...), or None."""
     return register_proxy_url() or None
+
+
+def next_httpx_proxy() -> str | None:
+    """Rotate proxy for a new HTTP client slot."""
+    return next_register_proxy_url() or None
 
 
 def _host_from_url(url: str) -> str:
@@ -170,6 +368,17 @@ def _host_from_url(url: str) -> str:
 
 
 def _fs_post(payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """POST to local FlareSolverr.
+
+    Always bypass env HTTP(S)_PROXY / ALL_PROXY. Those are for
+    Playwright / httpx egress (REGISTER_PROXY); urllib has no socks5
+    handler and would fail with ``unknown url type: socks5`` if they are
+    set to a SOCKS URL. FS itself is loopback; the browser proxy is in
+    ``payload["proxy"]``.
+
+    FS returns HTTP 500 with a JSON body on challenge failure — still parse it
+    so callers see ``status=error`` / message instead of bare HTTPError.
+    """
     endpoint = f"{flaresolverr_url()}/v1"
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -178,8 +387,22 @@ def _fs_post(payload: dict[str, Any], timeout: float) -> dict[str, Any]:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        raw = response.read()
+    # Empty ProxyHandler → ignore HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read() if exc.fp is not None else b""
+        if not raw:
+            raise
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise
+        if isinstance(data, dict):
+            return data
+        raise
     return json.loads(raw.decode("utf-8"))
 
 
@@ -416,7 +639,7 @@ def cookie_header_for_host(host: str) -> str:
 
 
 def clearance_bundle() -> dict[str, Any]:
-    """Snapshot for HTTP sessions: cookies + UA + age."""
+    """Snapshot for HTTP sessions: cookies + UA + age (GPT-style ClearanceBundle)."""
     with _lock:
         cookies = [dict(c) for c in (_cache.get("cookies") or [])]
         return {

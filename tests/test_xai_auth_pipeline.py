@@ -56,6 +56,76 @@ def test_cancel_active_is_idempotent_while_cleanup_is_in_progress(tmp_path):
     asyncio.run(scenario())
 
 
+def test_authorization_concurrency_spawns_parallel_workers(tmp_path):
+    async def scenario():
+        class MultiSource:
+            def __init__(self, count):
+                self.count = count
+
+            async def records(self):
+                for index in range(self.count):
+                    yield SourceRecord(f"stock-{index}", f"opaque-{index}")
+
+            async def close(self):
+                return None
+
+        class SlowExecutor:
+            def __init__(self):
+                self.active = 0
+                self.peak = 0
+                self.calls = 0
+                self._lock = asyncio.Lock()
+
+            async def start(self):
+                return None
+
+            async def close(self):
+                return None
+
+            async def confirm(self, *_args):
+                async with self._lock:
+                    self.active += 1
+                    self.peak = max(self.peak, self.active)
+                    self.calls += 1
+                await asyncio.sleep(0.05)
+                async with self._lock:
+                    self.active -= 1
+                return AuthorizationResult(AuthorizationStatus.AUTHORIZED, "confirmed")
+
+        class ImmediateSink:
+            def __init__(self):
+                self.n = 0
+
+            async def store(self, _credential):
+                self.n += 1
+                return SinkReceipt(f"receipt-{self.n}")
+
+        executor = SlowExecutor()
+        ledger = Ledger(tmp_path / "ledger.db", b"salt")
+        pipeline = AuthPipeline(
+            source=MultiSource(3),
+            protocol=ImmediateProtocol(),
+            executor=executor,
+            sink=ImmediateSink(),
+            ledger=ledger,
+            timeout=2,
+            min_authorization_interval=0.0,
+            authorization_concurrency=2,
+        )
+        run = asyncio.create_task(pipeline.run())
+        try:
+            async with asyncio.timeout(3):
+                while executor.calls < 3:
+                    await asyncio.sleep(0.01)
+            assert executor.peak == 2
+            assert pipeline.status()["authorization_concurrency"] == 2
+        finally:
+            pipeline.request_stop()
+            await asyncio.wait_for(run, 2)
+
+    asyncio.run(scenario())
+
+
 class SingleSource:
     async def records(self):
         yield SourceRecord("stock", "opaque")
@@ -177,6 +247,59 @@ def test_pending_total_uses_current_snapshot_set_difference(tmp_path):
     assert pipeline.status()["pending_total"] == 2
     assert pipeline.status()["five_minute_imports_per_minute"] is None
     assert pipeline.status()["lifetime_imports_per_minute"] is None
+
+
+def test_authorization_starts_resume_from_ledger_history(tmp_path):
+    ledger = Ledger(tmp_path / "ledger.db", b"salt")
+    for index in range(3):
+        job_id = ledger.start(f"source-{index}", attempt=1)
+        ledger.mark_authorization_started(job_id)
+        ledger.finish(job_id, JobStatus.IMPORTED, "imported", f"receipt-{index}")
+
+    pipeline = AuthPipeline(
+        source=EmptySource(),
+        protocol=object(),
+        executor=NoopExecutor(),
+        sink=object(),
+        ledger=ledger,
+    )
+    assert pipeline._authorization_starts == 3
+    assert pipeline.status()["authorization_starts"] == 3
+    assert pipeline.status()["imported_unique"] == 3
+
+
+def test_nonfatal_authorization_guard_does_not_stop_pipeline(tmp_path):
+    async def scenario():
+        events = []
+        pipeline = _pipeline(tmp_path)
+        pipeline.event_callback = lambda kind, data: events.append((kind, data))
+        stopped = []
+        pipeline.request_stop = lambda: stopped.append(True)
+
+        async def boom():
+            raise RuntimeError("authorization worker exploded")
+
+        await pipeline._guard("authorization-0", boom(), fatal=False)
+        assert stopped == []
+        assert events == [
+            (
+                "pipeline_error",
+                {
+                    "stage": "authorization-0",
+                    "reason": "internal_error",
+                    "error_type": "RuntimeError",
+                    "fatal": False,
+                },
+            )
+        ]
+
+        # Structural stages remain fatal and still stop the service.
+        await pipeline._guard("source", boom(), fatal=True)
+        assert stopped == [True]
+        assert events[-1][1]["stage"] == "source"
+        assert events[-1][1]["fatal"] is True
+
+    asyncio.run(scenario())
 
 
 def test_pending_total_is_unknown_before_first_valid_snapshot(tmp_path):

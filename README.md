@@ -20,7 +20,7 @@ bash start.sh
 - [CF 清障栈](docs/guides/clearance.md)
 - [本地认证服务](docs/guides/auth-service.md)
 - [凭据库存与取用](docs/guides/credential-inventory.md)
-- [运行状态与排障](docs/guides/runtime-troubleshooting.md)
+- [运行状态与排障](docs/guides/runtime-troubleshooting.md)（跨机：unknown_page / 清障 env / 限流）
 
 常用命令：
 
@@ -55,13 +55,16 @@ REGISTER_PROXY=http://127.0.0.1:40080
 
 # 清障预热：调 clearance/ 里的 FlareSolverr
 CLEARANCE_ENABLED=1
+CLEARANCE_REQUIRED=0
 FLARESOLVERR_URL=http://127.0.0.1:8191
 CLEARANCE_URLS=https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai
 # FS 容器内出口（compose 服务名）；与 REGISTER_PROXY 同走 WARP
 CLEARANCE_PROXY=http://privoxy:8118
 ```
 
-详见 [clearance/README.md](clearance/README.md)。容器宜常驻；腾内存只收尸注册机 CloakBrowser，不要 `docker stop` FlareSolverr。
+`CLEARANCE_REQUIRED=0` 时，预热失败只打印警告，注册流程继续尝试后续页面抓取；
+需要严格依赖 clearance 的机器设为 `1`。详见 [clearance/README.md](clearance/README.md)。
+容器宜常驻；腾内存只收尸注册机 CloakBrowser，不要 `docker stop` FlareSolverr。
 
 ## 邮箱模式
 

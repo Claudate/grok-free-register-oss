@@ -20,7 +20,9 @@ acpa_watchdog.py — 自动 CPA 凭据整备驻守进程
        单次探针内 403 当场短重试 ACPA_403_IMMEDIATE_RETRIES×SLEEP（默认 2×4s）。
        仍 403 → chat_denied：不丢，RETEST_AFTER_SEC(默认 180s) 后回测 1 次；
          回测活 → alive；仍 403 → chat_dead 丢。
-       429 free-usage-exhausted / rate_limited / 401 → 立刻丢。
+       429 capacity / resource-exhausted（rate_limited）→ 当场短重试 + 软回测，不丢
+         （连打时前几枪 429、稍后 200 是常态，禁止当死号）。
+       仅 429 free-usage-exhausted / 401 → 立刻丢。
        alive 永不复探。
   4. 状态: keys/cpa_ready/_state.tsv
        name\tsub\temail\tstatus\tts\tprobes
@@ -51,8 +53,8 @@ from pathlib import Path
 # paths — portable: follow project root of this script; AUTH overridable via env
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # .../grok-free-register
-# Align with xai_enroller.service DEFAULT_LOCAL_AUTH_DIR
-# (~/Downloads/grok-free-register-auth/authenticated by default)
+# Align with xai_enroller.service DEFAULT_LOCAL_AUTH_DIR; remote root →
+# /root/Downloads/grok-free-register-auth/authenticated
 _AUTH_BASE = Path(
     os.environ.get(
         "XAI_ENROLLER_LOCAL_AUTH_DIR",
@@ -271,8 +273,8 @@ print(json.dumps({"status": status, "http": code, "snippet": txt[:200]}))
 sys.exit(0)
 '''
 
-# 省额度：默认首探 1 次；403 当场短重试后再标 soft，默认 3 分钟后延迟回测 1 次。
-# alive 永不复探。429 free-usage-exhausted / token_dead 等真坏号立刻丢。
+# 省额度：默认首探 1 次；403 / 容量 429 当场短重试后再标 soft，默认 3 分钟后延迟回测。
+# alive 永不复探。仅 free-usage-exhausted / token_dead 等真坏号立刻丢。
 MAX_PROBES = int(
     os.environ.get(
         "ACPA_MAX_PROBES",
@@ -285,35 +287,39 @@ PROBE_WARMUP_SEC = float(os.environ.get("ACPA_PROBE_WARMUP_SEC", "3.0"))
 # 单次 probe_one 内 403 当场短重试（不算额外 MAX_PROBES 预算）
 IMMEDIATE_403_RETRIES = int(os.environ.get("ACPA_403_IMMEDIATE_RETRIES", "2"))
 IMMEDIATE_403_SLEEP = float(os.environ.get("ACPA_403_IMMEDIATE_SLEEP", "4.0"))
+# 容量 429（resource-exhausted / too many requests）当场短重试；默认比 403 稍长
+IMMEDIATE_429_RETRIES = int(os.environ.get("ACPA_429_IMMEDIATE_RETRIES", "3"))
+IMMEDIATE_429_SLEEP = float(os.environ.get("ACPA_429_IMMEDIATE_SLEEP", "6.0"))
 RETEST_AFTER_SEC = int(os.environ.get("ACPA_RETEST_AFTER_SEC", "180"))  # 3 分钟
 RETEST_MAX = int(os.environ.get("ACPA_RETEST_MAX", "1"))  # 403 延迟回测次数
+# 容量 429 软回测次数（与 403 分开；连打池时常要多等几轮）
+RETEST_MAX_429 = int(os.environ.get("ACPA_RETEST_MAX_429", "3"))
 
 # 终态：不再探（alive 保留；下列坏号 discard）
 TERMINAL_OK = frozenset({"alive"})
 TERMINAL_BAD = frozenset({
-    "free_exhausted",   # 429 免费额度耗尽 → 丢
-    "rate_limited",     # 其它 429 → 丢
+    "free_exhausted",   # 429 免费额度耗尽 → 丢（唯一的 429 真死）
     "token_dead",       # 401
     "no_quota_paid_end",
-    "chat_dead",        # 5 分钟回测后仍 403 → 真坏，丢
+    "chat_dead",        # 回测后仍 403 → 真坏，丢
     "discarded",
 })
 TERMINAL_STATUSES = TERMINAL_OK | TERMINAL_BAD
 
-# 仅这些立刻/确认后丢出 cpa_ready（403 首探不在此列）
+# 仅这些立刻/确认后丢出 cpa_ready（容量 429 / 首探 403 不在此列）
 DISCARD_STATUSES = frozenset({
     "free_exhausted",
-    "rate_limited",
     "token_dead",
     "no_quota_paid_end",
     "chat_dead",
 })
 
-# 等 5 分钟回测的软状态（保留 json，不进 acc，不丢）
+# 延迟回测的软状态（保留 json，不进 acc，不丢）
 SOFT_RETEST_STATUSES = frozenset({
     "chat_denied",
     "forbidden_domain_ban",  # 历史误标，按 403 软状态回测
     "probe_cap",             # 历史：首探 2 次 403 被钉死，捞回可回测
+    "rate_limited",          # 容量 429：连打前几枪常态，软回测
 })
 
 
@@ -337,21 +343,29 @@ def probe_one(path: Path) -> dict:
 
 def probe_one_soft(path: Path) -> dict:
     """
-    一次「逻辑探针」：底层请求 + 403/瞬时错误当场短重试。
+    一次「逻辑探针」：底层请求 + 403/容量 429/瞬时错误当场短重试。
     仍计为 probe_budgeted 的 1 次 used（不因短重试烧额外额度记账）。
+
+    free_exhausted / 401 立刻返回（真坏）。
+    rate_limited（容量 429）当场再打几枪，仍 429 才以 soft 状态返回，不丢号。
     """
     last = {"status": "probe_err", "http": -1, "snippet": ""}
-    attempts = 1 + max(0, IMMEDIATE_403_RETRIES)
+    # 取 403/429 当场重试上限的较大值，循环内按状态选 sleep
+    attempts = 1 + max(0, IMMEDIATE_403_RETRIES, IMMEDIATE_429_RETRIES)
+    rate_hits = 0
     for i in range(attempts):
         last = probe_one(path)
         st = last.get("status")
-        if st in (
-            "alive", "free_exhausted", "rate_limited",
-            "no_quota_paid_end", "token_dead",
-        ):
+        if st in ("alive", "free_exhausted", "no_quota_paid_end", "token_dead"):
             return last
+        if st == "rate_limited":
+            rate_hits += 1
+            if rate_hits <= IMMEDIATE_429_RETRIES and i + 1 < attempts:
+                time.sleep(IMMEDIATE_429_SLEEP)
+                continue
+            return last  # soft：交给延迟回测，禁止 discard
         if st in ("chat_denied", "forbidden_domain_ban", "probe_err", "unknown"):
-            if i + 1 < attempts:
+            if i + 1 < attempts and (i < IMMEDIATE_403_RETRIES):
                 time.sleep(IMMEDIATE_403_SLEEP)
                 continue
         break
@@ -367,7 +381,8 @@ def probe_one_soft(path: Path) -> dict:
 def probe_budgeted(path: Path, budget: int) -> tuple[dict, int]:
     """
     在 budget 次内探活。返回 (最后结果, 实际探活次数)。
-    alive / 额度终态立刻停；403 可在预算内连探；最终 403 保持 chat_denied（不改 probe_cap）。
+    alive / free_exhausted / 401 立刻停；
+    403 / rate_limited 可在预算内连探；最终 soft 状态交给延迟回测。
     """
     budget = max(0, int(budget))
     if budget <= 0:
@@ -378,15 +393,13 @@ def probe_budgeted(path: Path, budget: int) -> tuple[dict, int]:
         last = probe_one_soft(path)
         used += 1
         st = last.get("status")
-        if st in (
-            "alive", "free_exhausted", "rate_limited",
-            "no_quota_paid_end", "token_dead",
-        ):
+        if st in ("alive", "free_exhausted", "no_quota_paid_end", "token_dead"):
             return last, used
+        # rate_limited 已在 soft 内当场重试；预算>1 时再给一轮逻辑探针
         if i + 1 < budget and st in (
-            "chat_denied", "forbidden_domain_ban", "probe_err", "unknown",
+            "chat_denied", "forbidden_domain_ban", "probe_err", "unknown", "rate_limited",
         ):
-            time.sleep(PROBE_RETRY_SLEEP)
+            time.sleep(PROBE_RETRY_SLEEP if st != "rate_limited" else IMMEDIATE_429_SLEEP)
             continue
         break
     # 首探/回测结束仍是 403 → 保持 chat_denied，交给延迟回测或 chat_dead
@@ -469,7 +482,7 @@ def prune_orphan_state(st: dict) -> int:
 
 
 def should_discard(status: str, probes: int = 0) -> bool:
-    """仅真坏号丢：429 额度耗尽 / 401 / 回测后仍 403(chat_dead)。首探 403 不丢。"""
+    """仅真坏号丢：free_exhausted / 401 / 回测后 chat_dead。首探 403 与容量 429 不丢。"""
     return status in DISCARD_STATUSES
 
 
@@ -554,8 +567,9 @@ def sweep_discard(st: dict) -> int:
         if v.get("status") == "discarded":
             discard_bad(name, st)  # 清残留 json
             continue
-        # 软 403 已用完延迟回测次数 → 升格 chat_dead 再丢
-        if v.get("status") in SOFT_RETEST_STATUSES:
+        # 403 软状态用完延迟回测 → 升格 chat_dead 再丢。
+        # 容量 429 永不升格丢弃：停探即可，json 留在 cpa_ready 供人工/后续再探。
+        if v.get("status") in SOFT_RETEST_STATUSES and v.get("status") != "rate_limited":
             if _retests_done(v) >= RETEST_MAX and _age_sec(v) >= RETEST_AFTER_SEC:
                 v["status"] = "chat_dead"
                 st[name] = v
@@ -568,42 +582,58 @@ def sweep_discard(st: dict) -> int:
 
 def rescue_soft_discards(st: dict) -> int:
     """
-    把误丢的 403/probe_cap 从 _discarded 捞回主目录，标 chat_denied，
-    立刻可做一次延迟回测（ts 回拨到已到期）。
-    账本原因为 soft，或 state 已 discarded 但 json 仍在 _discarded 且无硬坏标记。
+    把误丢的 403 / 容量 429 从 _discarded 捞回主目录，立刻可回测。
+    - 账本 status/reason 为 soft（含 rate_limited）→ 按原 soft 状态捞
+    - free_exhausted / token_dead 等硬坏 → 不捞
+    - 无账本线索的旧 discarded：默认按 rate_limited 捞（历史误杀几乎全是容量 429）
     """
     ensure_dir(DISCARD_DIR)
     ensure_dir(OUT_DIR)
     soft_reasons = SOFT_RETEST_STATUSES | {"probe_cap", "chat_denied", "forbidden_domain_ban"}
-    soft_names: set[str] = set()
+    hard_reasons = DISCARD_STATUSES | {"discarded"}
+    # name → 恢复后应写的 soft status
+    soft_status_for: dict[str, str] = {}
     ledger = DISCARD_DIR / "_discarded.tsv"
     if ledger.exists():
         for ln in ledger.read_text(encoding="utf-8").splitlines():
             parts = ln.split("\t")
-            if len(parts) >= 5:
-                name, prev_st, reason = parts[1], parts[3], parts[4]
-                if prev_st in soft_reasons or reason in soft_reasons:
-                    soft_names.add(name)
-            elif len(parts) >= 4:
-                name, prev_st = parts[1], parts[3]
-                if prev_st in soft_reasons:
-                    soft_names.add(name)
+            if len(parts) < 4:
+                continue
+            name, prev_st = parts[1], parts[3]
+            reason = parts[4] if len(parts) >= 5 else prev_st
+            if prev_st in hard_reasons or reason in hard_reasons:
+                # 硬坏：明确排除（即便后面无线索分支也不捞）
+                soft_status_for.pop(name, None)
+                soft_status_for.setdefault(name, "")  # marker empty = hard skip
+                soft_status_for[name] = ""
+                continue
+            if prev_st in soft_reasons or reason in soft_reasons:
+                # rate_limited 保持 rate_limited；403 类统一 chat_denied
+                if prev_st == "rate_limited" or reason == "rate_limited":
+                    soft_status_for[name] = "rate_limited"
+                else:
+                    soft_status_for[name] = "chat_denied"
 
     n = 0
     for p in sorted(DISCARD_DIR.glob("xai-*.json")):
         if not RUN:
             break
         name = p.name
-        # 账本标 soft，或 state 缺/已 discarded 时默认按 soft 捞（旧误丢）
         entry = st.get(name) or {}
         prev = entry.get("status", "discarded")
-        if name not in soft_names and prev not in ("discarded", "") and prev not in soft_reasons:
+        restore_as = soft_status_for.get(name)
+
+        if restore_as == "":
+            # 账本标硬坏
             continue
-        if name not in soft_names and prev == "discarded":
-            # 无账本线索：仍捞（用户确认 403 常误杀）；真 429 已不在 soft 集合时靠账本
-            soft_names.add(name)
-        if name not in soft_names:
-            continue
+        if restore_as is None:
+            # 无账本：旧逻辑默认捞；历史误杀以容量 429 为主
+            if prev not in ("discarded", "", *soft_reasons):
+                continue
+            restore_as = "rate_limited" if prev in ("discarded", "", "rate_limited") else "chat_denied"
+            if prev in SOFT_RETEST_STATUSES:
+                restore_as = prev if prev == "rate_limited" else "chat_denied"
+
         dest = OUT_DIR / name
         try:
             if dest.exists():
@@ -613,16 +643,16 @@ def rescue_soft_discards(st: dict) -> int:
         except OSError as exc:
             log(f"  ✗ rescue 移动失败 {name}: {exc}")
             continue
-        # ts 回拨：立刻进入可回测窗口（不额外空等 RETEST_AFTER_SEC）
+        # ts 回拨：立刻进入可回测窗口
         st[name] = {
             "sub": entry.get("sub", ""),
             "email": entry.get("email", ""),
-            "status": "chat_denied",
+            "status": restore_as,
             "ts": int(time.time()) - RETEST_AFTER_SEC,
-            "probes": MAX_PROBES,  # 留给 1 次回测额度（与当前 MAX_PROBES 对齐）
+            "probes": MAX_PROBES,
         }
         n += 1
-        log(f"  ↩ rescue {name} → chat_denied (retest due) probes={MAX_PROBES}")
+        log(f"  ↩ rescue {name} → {restore_as} (retest due) probes={MAX_PROBES}")
     if n:
         write_state(st)
     return n
@@ -650,11 +680,18 @@ def _retests_done(entry: dict) -> int:
     return max(0, _probes(entry) - MAX_PROBES)
 
 
+def _soft_retest_max(status: str) -> int:
+    """容量 429 与 403 分轨：连打池 429 更常见，默认多给几轮。"""
+    if status == "rate_limited":
+        return RETEST_MAX_429
+    return RETEST_MAX
+
+
 def should_probe(name: str, st: dict) -> bool:
     """
     新号：首探（≤MAX_PROBES 次当场连探）。
-    403 软状态：满首探后等 RETEST_AFTER_SEC，再给 RETEST_MAX 次回测。
-    429/真坏/终态：不探。
+    软状态（403 / 容量 429）：满首探后等 RETEST_AFTER_SEC，再回测。
+    free_exhausted / 真坏 / 终态：不探。
     """
     if name not in st:
         return True
@@ -664,7 +701,7 @@ def should_probe(name: str, st: dict) -> bool:
     probes = _probes(st[name])
 
     if cur in SOFT_RETEST_STATUSES:
-        if _retests_done(st[name]) >= RETEST_MAX:
+        if _retests_done(st[name]) >= _soft_retest_max(cur):
             return False
         # 首探未打满（异常中断）→ 先补完首探，不算延迟回测
         if probes < MAX_PROBES:
@@ -706,7 +743,7 @@ def process_file(name: str, st: dict, *, force_probe: bool = False) -> None:
     is_soft_retest = (
         prev_status in SOFT_RETEST_STATUSES
         and already >= MAX_PROBES
-        and _retests_done(st.get(name, {})) < RETEST_MAX
+        and _retests_done(st.get(name, {})) < _soft_retest_max(prev_status)
     )
 
     if not force_probe and not should_probe(name, st):
@@ -717,10 +754,12 @@ def process_file(name: str, st: dict, *, force_probe: bool = False) -> None:
         # 软状态未到点：静默整备
         if prev_status in SOFT_RETEST_STATUSES:
             left = max(0, RETEST_AFTER_SEC - _age_sec(st[name]))
-            if already >= MAX_PROBES and _retests_done(st[name]) < RETEST_MAX:
+            max_rt = _soft_retest_max(prev_status)
+            if already >= MAX_PROBES and _retests_done(st[name]) < max_rt:
+                tag = "429" if prev_status == "rate_limited" else "403"
                 log(
-                    f"  • {name} 403 待回测 "
-                    f"({left}s / retest={_retests_done(st[name])}/{RETEST_MAX})"
+                    f"  • {name} {tag} 待回测 "
+                    f"({left}s / retest={_retests_done(st[name])}/{max_rt})"
                 )
                 return
         log(
@@ -729,7 +768,7 @@ def process_file(name: str, st: dict, *, force_probe: bool = False) -> None:
         )
         return
 
-    if force_probe and already >= MAX_PROBES + RETEST_MAX and not os.environ.get("ACPA_FORCE_IGNORE_CAP"):
+    if force_probe and already >= MAX_PROBES + max(RETEST_MAX, RETEST_MAX_429) and not os.environ.get("ACPA_FORCE_IGNORE_CAP"):
         log(f"  • {name} 已 probes={already}，跳过强制重探（省额度）")
         if should_discard(st.get(name, {}).get("status", ""), already):
             discard_bad(name, st)
@@ -738,14 +777,15 @@ def process_file(name: str, st: dict, *, force_probe: bool = False) -> None:
 
     if is_soft_retest:
         budget = 1
-        phase = f"403回测×1 (after {RETEST_AFTER_SEC}s, done={_retests_done(st[name])}/{RETEST_MAX})"
+        max_rt = _soft_retest_max(prev_status)
+        tag = "429" if prev_status == "rate_limited" else "403"
+        phase = (
+            f"{tag}回测×1 (after {RETEST_AFTER_SEC}s, "
+            f"done={_retests_done(st[name])}/{max_rt})"
+        )
     else:
         budget = max(0, MAX_PROBES - already)
         phase = f"首探×≤{budget} (used={already}/{MAX_PROBES})"
-
-    # 新号首探前 warmup：刚 mint 的 access 常被上游瞬时 403
-    if not is_soft_retest and PROBE_WARMUP_SEC > 0:
-        time.sleep(PROBE_WARMUP_SEC)
 
     # 新号首探前 warmup：刚 mint 的 access 常被上游瞬时 403
     if not is_soft_retest and PROBE_WARMUP_SEC > 0:
@@ -757,15 +797,44 @@ def process_file(name: str, st: dict, *, force_probe: bool = False) -> None:
     snip = r.get("snippet", "")
     new_probes = already + used
 
-    # 延迟回测仍 403 → 真坏 chat_dead
-    if is_soft_retest and status in (
-        "chat_denied", "forbidden_domain_ban", "probe_cap", "probe_err", "unknown",
-    ):
-        status = "chat_dead"
-        log(
-            f"    {name}: [chat_dead] 回测仍 403/失败 http={r.get('http')} "
-            f"probes={new_probes} {snip[:70]}"
-        )
+    # 延迟回测仍失败 → 升格
+    # 403 类：chat_dead；容量 429：若回测次数已满则 chat_dead，否则保持 rate_limited 等下一轮
+    if is_soft_retest:
+        if prev_status == "rate_limited":
+            if status == "alive":
+                pass
+            elif status == "free_exhausted":
+                pass  # 真额度死，走 discard
+            elif status in (
+                "rate_limited", "chat_denied", "forbidden_domain_ban",
+                "probe_cap", "probe_err", "unknown",
+            ):
+                # 仍容量抖：保留 rate_limited 软状态；用完 RETEST_MAX_429 由 sweep 升格
+                status = "rate_limited"
+                done = _retests_done({"probes": new_probes})  # probes after this attempt
+                log(
+                    f"    {name}: [rate_limited] 回测仍容量 429/失败 "
+                    f"http={r.get('http')} probes={new_probes} "
+                    f"retest≈{done}/{RETEST_MAX_429} {snip[:50]}"
+                )
+            else:
+                log(
+                    f"    {name}: [{status}] http={r.get('http')} "
+                    f"probes={new_probes} {snip[:70]}"
+                )
+        elif status in (
+            "chat_denied", "forbidden_domain_ban", "probe_cap", "probe_err", "unknown",
+        ):
+            status = "chat_dead"
+            log(
+                f"    {name}: [chat_dead] 回测仍 403/失败 http={r.get('http')} "
+                f"probes={new_probes} {snip[:70]}"
+            )
+        else:
+            log(
+                f"    {name}: [{status}] http={r.get('http')} "
+                f"probes={new_probes} {snip[:70]}"
+            )
     else:
         log(
             f"    {name}: [{status}] http={r.get('http')} "
@@ -835,7 +904,7 @@ def main() -> int:
     ap.add_argument(
         "--reprobe-soft",
         action="store_true",
-        help="立刻对 chat_denied/probe_cap 等软 403 做回测（仍 1 次/号，受 RETEST_MAX）",
+        help="立刻对 chat_denied/rate_limited 等软状态做回测（受 RETEST_MAX / RETEST_MAX_429）",
     )
     ap.add_argument(
         "--no-rescue",
@@ -864,14 +933,16 @@ def main() -> int:
         f"启动 | 出货={AUTH_DIR} | 落盘={OUT_DIR} | state={len(st)} 条 "
         f"(启动 prune {n_prune}) | 首探≤{MAX_PROBES}/号 "
         f"| warmup={PROBE_WARMUP_SEC}s 403即重试={IMMEDIATE_403_RETRIES}×{IMMEDIATE_403_SLEEP}s "
+        f"| 429即重试={IMMEDIATE_429_RETRIES}×{IMMEDIATE_429_SLEEP}s "
         f"| 403回测 after={RETEST_AFTER_SEC}s ×{RETEST_MAX} "
+        f"| 429回测 ×{RETEST_MAX_429} "
         f"| soft_403={soft_n} | pending_discard={bad_n}"
     )
 
     if not args.no_rescue:
         n_res = rescue_soft_discards(st)
         if n_res:
-            log(f"启动捞回误丢 403 {n_res} 个（将回测）")
+            log(f"启动捞回误丢 soft(403/容量429) {n_res} 个（将回测）")
 
     n0 = sweep_discard(st)
     if n0:
@@ -880,7 +951,7 @@ def main() -> int:
     if st and not args.reprobe_soft:
         log(
             f"(state 已有: 刷 alive 整备；403 满 {RETEST_AFTER_SEC}s 回测×{RETEST_MAX}；"
-            f"429 free_exhausted 立刻丢)"
+            f"容量429 回测×{RETEST_MAX_429} 不丢；仅 free_exhausted/401 立刻丢)"
         )
         for name in list(st.keys()):
             if not RUN:

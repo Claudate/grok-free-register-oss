@@ -50,7 +50,7 @@ async def main_async(args=None):
         else SQLiteSourceAdapter(settings.source_db, settings.source_salt)
     )
 
-    # CF prewarm (external FlareSolverr) + register-side proxy for httpx/Playwright
+    # CF prewarm (chatgpt2api FlareSolverr) + register-side proxy for httpx/Playwright
     try:
         from grok_register.clearance import (
             format_prewarm_log,

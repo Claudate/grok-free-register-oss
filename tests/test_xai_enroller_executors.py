@@ -4,8 +4,95 @@ from contextlib import suppress
 import httpx
 import pytest
 
-from xai_enroller.executors import HTTPProbeExecutor, PlaywrightExecutor
+from xai_enroller.executors import (
+    HTTPProbeExecutor,
+    HTTPProtocolExecutor,
+    PlaywrightExecutor,
+)
 from xai_enroller.models import AuthorizationStatus, DeviceFlow, SourceRecord
+
+
+def test_http_protocol_executor_verify_and_approve_with_forced_action():
+    calls = []
+
+    def handler(request):
+        calls.append(
+            {
+                "method": request.method,
+                "url": str(request.url),
+                "body": request.content.decode(),
+                "cookie": request.headers.get("cookie", ""),
+            }
+        )
+        if request.url.path.endswith("/oauth2/device/verify"):
+            return httpx.Response(
+                303,
+                headers={
+                    "location": "https://accounts.x.ai/oauth2/device/consent?user_code=ABCD"
+                },
+            )
+        if request.url.path.endswith("/oauth2/device/approve"):
+            assert "action=allow" in request.content.decode()
+            assert "user_code=ABCD" in request.content.decode()
+            return httpx.Response(
+                303,
+                headers={"location": "https://accounts.x.ai/oauth2/device/done"},
+            )
+        return httpx.Response(500, text="unexpected")
+
+    executor = HTTPProtocolExecutor(
+        httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False),
+        concurrency=2,
+    )
+    result = asyncio.run(
+        executor.confirm(
+            SourceRecord("source", "sso-token"),
+            DeviceFlow(
+                "device",
+                "ABCD",
+                "https://accounts.x.ai/oauth2/device?user_code=ABCD",
+                60,
+                1,
+            ),
+        )
+    )
+    assert result.status is AuthorizationStatus.AUTHORIZED
+    assert result.reason_code == "confirmed"
+    assert [row["url"] for row in calls] == [
+        "https://auth.x.ai/oauth2/device/verify",
+        "https://auth.x.ai/oauth2/device/approve",
+    ]
+    assert all("sso=sso-token" in row["cookie"] for row in calls)
+
+
+def test_http_protocol_executor_maps_rate_limit_on_verify():
+    def handler(request):
+        if request.url.path.endswith("/oauth2/device/verify"):
+            return httpx.Response(
+                303,
+                headers={
+                    "location": "https://accounts.x.ai/oauth2/device?error=rate_limited"
+                },
+            )
+        return httpx.Response(500, text="unexpected")
+
+    executor = HTTPProtocolExecutor(
+        httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=False)
+    )
+    result = asyncio.run(
+        executor.confirm(
+            SourceRecord("source", "sso-token"),
+            DeviceFlow(
+                "device",
+                "ABCD",
+                "https://accounts.x.ai/oauth2/device?user_code=ABCD",
+                60,
+                1,
+            ),
+        )
+    )
+    assert result.status is AuthorizationStatus.NEEDS_INTERACTION
+    assert result.reason_code == "rate_limited"
 
 
 def test_http_probe_classifies_403_challenge_without_submission():

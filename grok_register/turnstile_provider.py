@@ -145,9 +145,9 @@ def _mint_two_step(
     timeout_error: str,
     missing_key_error: str = "missing_client_key",
 ) -> Optional[str]:
-    """createTask + getTaskResult (YesCaptcha / CapSolver / external farm shape).
+    """createTask + getTaskResult (YesCaptcha / CapSolver / external lite shape).
 
-    External farms may accept empty clientKey when their API_KEY is unset.
+    External lite farm accepts empty clientKey when its API_KEY is unset.
     Commercial CapSolver still needs a real key. This is pure HTTP — no browser.
     """
     base = (base or "").rstrip("/")

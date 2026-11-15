@@ -172,16 +172,29 @@ class MinimumStartInterval:
         self._sleep = sleep
         self._last_started_at = self._clock() if self.seconds > 0 else None
         self._success_streak = 0
+        # Serialize concurrent wait+mark so 2–3 auth workers cannot stampede starts.
+        self._lock = asyncio.Lock()
 
     async def wait(self):
-        if self._last_started_at is None or self.seconds <= 0:
-            return
-        delay = self.seconds - (self._clock() - self._last_started_at)
-        if delay > 0:
-            await self._sleep(delay)
+        """Wait until the next start slot; holds the lock only around the check/sleep."""
+        async with self._lock:
+            if self._last_started_at is None or self.seconds <= 0:
+                return
+            delay = self.seconds - (self._clock() - self._last_started_at)
+            if delay > 0:
+                await self._sleep(delay)
 
     def mark_started(self):
         self._last_started_at = self._clock()
+
+    async def wait_and_mark(self):
+        """Atomically wait for the min interval, then mark a start (process-wide)."""
+        async with self._lock:
+            if self._last_started_at is not None and self.seconds > 0:
+                delay = self.seconds - (self._clock() - self._last_started_at)
+                if delay > 0:
+                    await self._sleep(delay)
+            self._last_started_at = self._clock()
 
     def note_rate_limited(self):
         """Raise the live start interval after an upstream rate-limit trip."""
@@ -227,6 +240,8 @@ class AuthPipeline:
     FLOW_SAFETY_MARGIN_SECONDS = 60.0
     TRANSIENT_RETRY_DELAYS = (5.0, 15.0, 30.0)
     CANCEL_RETRY_DELAY = 60.0
+    # Service path clamps to 1–3; batch path may pass higher via coordinator.
+    MAX_AUTHORIZATION_CONCURRENCY = 4
 
     def __init__(
         self,
@@ -238,6 +253,7 @@ class AuthPipeline:
         ledger,
         timeout=1800.0,
         min_authorization_interval=0.0,
+        authorization_concurrency=1,
         event_callback=None,
         clock=time.monotonic,
     ):
@@ -250,9 +266,19 @@ class AuthPipeline:
         self.event_callback = event_callback
         self._clock = clock
 
+        concurrency = int(authorization_concurrency)
+        if concurrency < 1 or concurrency > self.MAX_AUTHORIZATION_CONCURRENCY:
+            raise ValueError(
+                "authorization_concurrency must be between 1 and "
+                f"{self.MAX_AUTHORIZATION_CONCURRENCY}"
+            )
+        self.authorization_concurrency = concurrency
+        prepared_capacity = max(self.PREPARED_QUEUE_CAPACITY, concurrency)
+        completion_capacity = max(self.COMPLETION_QUEUE_CAPACITY, concurrency)
+
         self.source_queue = asyncio.Queue(maxsize=self.SOURCE_QUEUE_CAPACITY)
-        self.prepared_queue = asyncio.Queue(maxsize=self.PREPARED_QUEUE_CAPACITY)
-        self.completion_queue = asyncio.Queue(maxsize=self.COMPLETION_QUEUE_CAPACITY)
+        self.prepared_queue = asyncio.Queue(maxsize=prepared_capacity)
+        self.completion_queue = asyncio.Queue(maxsize=completion_capacity)
         self.rate_gate = GlobalRateLimitGate(clock=clock)
         self.start_interval = MinimumStartInterval(
             min_authorization_interval,
@@ -273,18 +299,52 @@ class AuthPipeline:
         self._running = False
         self._tasks = []
 
-        self._authorization_task = None
-        self._authorization_cancellable = False
+        # task -> cancellable; supports concurrent authorization workers.
+        self._authorization_tasks = {}
         self._completion_task = None
         self._completion_cancellable = False
         self._started_monotonic = self._clock()
         self._process_imports = 0
-        self._authorization_starts = 0
+        # Continue task numbers from prior runs so restart does not look like #1.
+        self._authorization_starts = self.ledger.authorization_start_count()
         self._recent_imports = deque()
 
         self.ledger.recover_pending()
         for fingerprint in self.ledger.imported_fingerprints():
             self._states[fingerprint] = PipelineState.IMPORTED
+
+    @property
+    def _authorization_task(self):
+        """Any in-flight authorization task (tests / legacy single-slot readers)."""
+        for task in self._authorization_tasks:
+            if not task.done():
+                return task
+        return None
+
+    @_authorization_task.setter
+    def _authorization_task(self, task):
+        # Tests assign a single synthetic task; treat as the sole active entry.
+        self._authorization_tasks.clear()
+        if task is not None:
+            self._authorization_tasks[task] = False
+
+    @property
+    def _authorization_cancellable(self):
+        return any(
+            cancellable and not task.done()
+            for task, cancellable in self._authorization_tasks.items()
+        )
+
+    @_authorization_cancellable.setter
+    def _authorization_cancellable(self, value):
+        task = self._authorization_task
+        if task is None:
+            return
+        self._authorization_tasks[task] = bool(value)
+
+    def _set_authorization_cancellable(self, task, value):
+        if task in self._authorization_tasks:
+            self._authorization_tasks[task] = bool(value)
 
     def _emit(self, kind, data):
         if self.event_callback is None:
@@ -294,14 +354,23 @@ class AuthPipeline:
         except Exception:
             pass
 
-    async def _guard(self, stage, coroutine):
+    async def _guard(self, stage, coroutine, *, fatal=True):
         try:
             await coroutine
         except asyncio.CancelledError:
             raise
-        except Exception:
-            self._emit("pipeline_error", {"stage": stage, "reason": "internal_error"})
-            self.request_stop()
+        except Exception as exc:
+            self._emit(
+                "pipeline_error",
+                {
+                    "stage": stage,
+                    "reason": "internal_error",
+                    "error_type": type(exc).__name__,
+                    "fatal": fatal,
+                },
+            )
+            if fatal:
+                self.request_stop()
 
     async def run(self):
         if self._running:
@@ -314,13 +383,40 @@ class AuthPipeline:
             self._tasks = [
                 asyncio.create_task(self._guard("source", self._source_worker())),
                 asyncio.create_task(self._guard("retry", self._retry_worker())),
-                asyncio.create_task(self._guard("prepare", self._prepare_worker())),
+                # prepare recovers per-item ledger/network failures; keep loop alive
                 asyncio.create_task(
-                    self._guard("authorization", self._authorization_worker())
+                    self._guard("prepare", self._prepare_worker(), fatal=False)
                 ),
-                asyncio.create_task(self._guard("completion", self._completion_worker())),
+                asyncio.create_task(
+                    self._guard("completion", self._completion_worker(), fatal=False)
+                ),
             ]
-            self._emit("service_started", self.start_interval.snapshot())
+            for index in range(self.authorization_concurrency):
+                self._tasks.append(
+                    asyncio.create_task(
+                        self._guard(
+                            f"authorization-{index}",
+                            self._authorization_worker(),
+                            # Worker loop recovers per-task failures; only exit
+                            # on structural death of the loop itself (non-fatal
+                            # so sibling workers keep draining the queue).
+                            fatal=False,
+                        )
+                    )
+                )
+            started = self.start_interval.snapshot()
+            started["authorization_concurrency"] = self.authorization_concurrency
+            counts = self.ledger.aggregate_counts()
+            inventory = self.ledger.inventory_counts()
+            started.update(
+                {
+                    "imported_unique": counts.get("imported_unique", 0),
+                    "authorization_starts": self._authorization_starts,
+                    "pending_total": self._pending_total(),
+                    **inventory,
+                }
+            )
+            self._emit("service_started", started)
             await self._stop_requested.wait()
         finally:
             await self._shutdown()
@@ -377,15 +473,18 @@ class AuthPipeline:
         self._resume.set()
 
     async def cancel_active(self):
+        """Cancel one in-flight cancellable authorization (or completion) task.
+
+        With concurrent workers, cancels a single active authorization if any is
+        cancellable; otherwise falls back to completion. Idempotent for a given task.
+        """
         task = None
-        if (
-            self._authorization_cancellable
-            and self._authorization_task is not None
-            and not self._authorization_task.done()
-        ):
-            task = self._authorization_task
-            self._authorization_cancellable = False
-        elif (
+        for candidate, cancellable in list(self._authorization_tasks.items()):
+            if cancellable and not candidate.done():
+                task = candidate
+                self._authorization_tasks[candidate] = False
+                break
+        if task is None and (
             self._completion_cancellable
             and self._completion_task is not None
             and not self._completion_task.done()
@@ -458,12 +557,33 @@ class AuthPipeline:
     async def _prepare_worker(self):
         while not self._stopping:
             await self._prepare_slot_available.wait()
-            self._prepare_slot_available.clear()
+            if self.prepared_queue.full():
+                self._prepare_slot_available.clear()
+                continue
             source = await self.source_queue.get()
             fingerprint = self.ledger.fingerprint(source.source_id)
-            attempt = self.ledger.next_attempt(fingerprint)
-            job_id = self.ledger.start_fingerprint(fingerprint, attempt=attempt)
+            job_id = None
+            attempt = None
             try:
+                try:
+                    attempt = self.ledger.next_attempt(fingerprint)
+                    job_id = self.ledger.start_fingerprint(fingerprint, attempt=attempt)
+                except Exception as exc:
+                    # Ledger lock/corruption must not kill the service: requeue later.
+                    self._emit(
+                        "pipeline_error",
+                        {
+                            "stage": "prepare_ledger",
+                            "reason": "internal_error",
+                            "error_type": type(exc).__name__,
+                            "fatal": False,
+                        },
+                    )
+                    await self._schedule_retry(
+                        source, fingerprint, self.CANCEL_RETRY_DELAY
+                    )
+                    self._prepare_slot_available.set()
+                    continue
                 try:
                     flow = await self._start_flow()
                 except asyncio.CancelledError:
@@ -507,6 +627,10 @@ class AuthPipeline:
                 except asyncio.CancelledError:
                     self.ledger.finish(job_id, JobStatus.CANCELLED, "shutdown_cancelled")
                     raise
+                if self.prepared_queue.full():
+                    self._prepare_slot_available.clear()
+                else:
+                    self._prepare_slot_available.set()
             finally:
                 self.source_queue.task_done()
 
@@ -532,21 +656,44 @@ class AuthPipeline:
             prepared = await self.prepared_queue.get()
             self._prepare_slot_available.set()
             task = asyncio.create_task(self._authorize(prepared))
-            self._authorization_task = task
+            self._authorization_tasks[task] = False
             try:
                 await task
             except asyncio.CancelledError:
                 if self._stopping:
                     raise
+            except Exception as exc:
+                # One account/task crash must not take down the whole service.
+                self._emit(
+                    "pipeline_error",
+                    {
+                        "stage": "authorization_task",
+                        "reason": "internal_error",
+                        "error_type": type(exc).__name__,
+                        "fatal": False,
+                        "task_number": getattr(prepared, "task_number", None),
+                    },
+                )
+                with suppress(Exception):
+                    await self._finish_failure(
+                        prepared.source,
+                        prepared.source_fingerprint,
+                        prepared.job_id,
+                        prepared.attempt_number,
+                        JobStatus.TRANSPORT_FAILED,
+                        "authorization_internal_error",
+                        retry=True,
+                        task_number=getattr(prepared, "task_number", None),
+                    )
             finally:
-                self._authorization_cancellable = False
-                self._authorization_task = None
+                self._authorization_tasks.pop(task, None)
                 self.prepared_queue.task_done()
 
-    async def _finish_if_already_imported(self, prepared, probe_token=None):
+    async def _finish_if_already_imported(self, prepared, probe_token=None, *, task=None):
         if not self.ledger.has_imported(prepared.source.source_id):
             return False
-        self._authorization_cancellable = False
+        if task is not None:
+            self._set_authorization_cancellable(task, False)
         self.ledger.finish(
             prepared.job_id,
             JobStatus.CANCELLED,
@@ -559,11 +706,12 @@ class AuthPipeline:
 
     async def _authorize(self, prepared):
         probe_token = None
-        self._authorization_cancellable = True
+        task = asyncio.current_task()
+        if task is not None and task in self._authorization_tasks:
+            self._authorization_tasks[task] = True
         try:
-            await self.start_interval.wait()
             await self._resume.wait()
-            if await self._finish_if_already_imported(prepared):
+            if await self._finish_if_already_imported(prepared, task=task):
                 return
             probe_token = await self.rate_gate.wait_for_permission(self._resume)
             while True:
@@ -571,7 +719,7 @@ class AuthPipeline:
                 try:
                     prepared = await self._refresh_flow_if_needed(prepared)
                 except ValueError:
-                    self._authorization_cancellable = False
+                    self._set_authorization_cancellable(task, False)
                     await self.rate_gate.inconclusive(probe_token)
                     await self._finish_failure(
                         prepared.source,
@@ -584,7 +732,7 @@ class AuthPipeline:
                     )
                     return
                 except Exception:
-                    self._authorization_cancellable = False
+                    self._set_authorization_cancellable(task, False)
                     await self.rate_gate.inconclusive(probe_token)
                     await self._finish_failure(
                         prepared.source,
@@ -601,11 +749,12 @@ class AuthPipeline:
                 ) >= self.FLOW_SAFETY_MARGIN_SECONDS:
                     break
 
-            if await self._finish_if_already_imported(prepared, probe_token):
+            if await self._finish_if_already_imported(prepared, probe_token, task=task):
                 return
 
             self._set_state(prepared.source_fingerprint, PipelineState.ACTIVE)
-            self.start_interval.mark_started()
+            # Process-wide pace: concurrent workers serialize start slots here.
+            await self.start_interval.wait_and_mark()
             self.ledger.mark_authorization_started(prepared.job_id)
             self._authorization_starts += 1
             prepared = replace(prepared, task_number=self._authorization_starts)
@@ -616,13 +765,16 @@ class AuthPipeline:
                     "attempt_number": prepared.attempt_number,
                     "source_queue": self.source_queue.qsize(),
                     "pending_total": self._pending_total(),
+                    "active_authorizations": sum(
+                        1 for t in self._authorization_tasks if not t.done()
+                    ),
                 },
             )
             async with asyncio.timeout(self.timeout):
                 authorization = await self.executor.confirm(
                     prepared.source, prepared.flow
                 )
-            self._authorization_cancellable = False
+            self._set_authorization_cancellable(task, False)
             if authorization.status is AuthorizationStatus.AUTHORIZED:
                 recovery_elapsed = await self.rate_gate.authorized(probe_token)
                 if recovery_elapsed is not None:
@@ -670,7 +822,6 @@ class AuthPipeline:
                 "browser_error",
                 "confirmation_timeout",
                 "challenge_required",
-                "consent_invalid_action",
                 "unknown_page",
             }
             if authorization.reason_code == "confirmation_timeout":
@@ -691,7 +842,7 @@ class AuthPipeline:
                 task_number=prepared.task_number,
             )
         except asyncio.CancelledError:
-            self._authorization_cancellable = False
+            self._set_authorization_cancellable(task, False)
             await self.rate_gate.inconclusive(probe_token)
             reason = "shutdown_cancelled" if self._stopping else "operator_cancelled"
             self.ledger.finish(prepared.job_id, JobStatus.CANCELLED, reason)
@@ -709,7 +860,7 @@ class AuthPipeline:
                 )
             raise
         except TimeoutError:
-            self._authorization_cancellable = False
+            self._set_authorization_cancellable(task, False)
             await self.rate_gate.inconclusive(probe_token)
             await self._finish_failure(
                 prepared.source,
@@ -722,7 +873,7 @@ class AuthPipeline:
                 task_number=prepared.task_number,
             )
         except (httpx.TransportError, OSError):
-            self._authorization_cancellable = False
+            self._set_authorization_cancellable(task, False)
             await self.rate_gate.inconclusive(probe_token)
             await self._finish_failure(
                 prepared.source,
@@ -734,9 +885,21 @@ class AuthPipeline:
                 retry=True,
                 task_number=prepared.task_number,
             )
-        except Exception:
-            self._authorization_cancellable = False
+        except Exception as exc:
+            # Keep the worker alive: treat unexpected auth exceptions as a
+            # transient browser failure so the rest of the queue continues.
+            self._set_authorization_cancellable(task, False)
             await self.rate_gate.inconclusive(probe_token)
+            self._emit(
+                "pipeline_error",
+                {
+                    "stage": "authorization_task",
+                    "reason": "internal_error",
+                    "error_type": type(exc).__name__,
+                    "fatal": False,
+                    "task_number": prepared.task_number,
+                },
+            )
             await self._finish_failure(
                 prepared.source,
                 prepared.source_fingerprint,
@@ -748,7 +911,7 @@ class AuthPipeline:
                 task_number=prepared.task_number,
             )
         finally:
-            self._authorization_cancellable = False
+            self._set_authorization_cancellable(task, False)
 
     async def _completion_worker(self):
         while not self._stopping:
@@ -760,6 +923,29 @@ class AuthPipeline:
             except asyncio.CancelledError:
                 if self._stopping:
                     raise
+            except Exception as exc:
+                prepared = completion.prepared
+                self._emit(
+                    "pipeline_error",
+                    {
+                        "stage": "completion_task",
+                        "reason": "internal_error",
+                        "error_type": type(exc).__name__,
+                        "fatal": False,
+                        "task_number": getattr(prepared, "task_number", None),
+                    },
+                )
+                with suppress(Exception):
+                    await self._finish_failure(
+                        prepared.source,
+                        prepared.source_fingerprint,
+                        prepared.job_id,
+                        prepared.attempt_number,
+                        JobStatus.TRANSPORT_FAILED,
+                        "completion_internal_error",
+                        retry=True,
+                        task_number=getattr(prepared, "task_number", None),
+                    )
             finally:
                 self._completion_cancellable = False
                 self._completion_task = None
@@ -1006,9 +1192,17 @@ class AuthPipeline:
         )
 
     def status(self):
+        active_authorizations = sum(
+            1 for task in self._authorization_tasks if not task.done()
+        )
         active_stages = []
-        if self._authorization_task is not None and not self._authorization_task.done():
-            active_stages.append("authorization")
+        if active_authorizations:
+            label = (
+                "authorization"
+                if active_authorizations == 1
+                else f"authorizationx{active_authorizations}"
+            )
+            active_stages.append(label)
         if self._completion_task is not None and not self._completion_task.done():
             active_stages.append("completion")
         retry_waiting = sum(
@@ -1029,6 +1223,8 @@ class AuthPipeline:
             "retry_waiting": retry_waiting,
             "next_retry_seconds": next_retry_seconds,
             "active_stage": "+".join(active_stages) if active_stages else "idle",
+            "active_authorizations": active_authorizations,
+            "authorization_concurrency": self.authorization_concurrency,
             "authorization_starts": self._authorization_starts,
             **self.rate_gate.snapshot(),
             **self.start_interval.snapshot(),

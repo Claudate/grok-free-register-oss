@@ -1,6 +1,6 @@
 """Pure-HTTP legs for x.ai signup (curl_cffi).
 
-Flow:
+Mirrors the GPT (chatgpt2api2) pattern + grok-register-lite xconsole_client:
   FlareSolverr / browser mints cf_clearance → inject into curl_cffi Session
   → Connect grpc-web + Next Server Action over HTTP.
 
@@ -8,16 +8,16 @@ What this module does NOT mint:
   - Castle request tokens (obfuscated JS; pass in or leave empty for A/B)
   - Turnstile tokens (iframe; pass in for createUser / CreateSession)
 
-Wire formats match live accounts.x.ai capture.
+Wire formats match live accounts.x.ai capture + lite xconsole_client.
 
 Critical: curl_cffi TLS impersonate must be a *recent* Chrome profile.
 chrome131 + modern CF clearance is rejected (403 HTML). Prefer chrome146
 (library default) and fall back through a known-good list. Always send the
 cf_clearance Cookie header explicitly — jar domain matching alone is flaky.
 
-Throughput notes:
+Throughput notes (2026-07, lite absorb):
   - Server Action body must carry conversionId + castleRequestToken +
-    react-query second arg; missing fields → silent 0-sso.
+    react-query second arg (lite shape); missing fields → silent 0-sso.
   - One Session RLock serializes all P/C; use XAIHttpClientPool for parallel.
   - CreateSession password fallback recovers sso when RSC has no set-cookie chain.
 """
@@ -221,7 +221,10 @@ class SignupResult:
     cf_blocked: bool = False
     elapsed_ms: int = 0
     error: str = ""
-    # How sso was obtained: set_cookie | direct | jar | create_session | ""
+    # How sso was obtained:
+    #   direct | set_cookie | session | body | create_session | ""
+    # "session" = cookie jar after this call cleared foreign SSO at entry
+    # (same-request Set-Cookie). Legacy "jar" without pre-clear is never emitted.
     sso_source: str = ""
 
 
@@ -295,13 +298,42 @@ class XAIHttpClient:
             except Exception:
                 pass
 
+    def clear_auth_cookies(self) -> None:
+        """Drop account SSO cookies; keep CF clearance.
+
+        Pool slots are reused across emails. Leaving ``sso`` / ``sso-rw`` in the
+        jar made the next register look successful via leftover cookies.
+        """
+        with self._lock:
+            _purge_auth_cookies(self.session)
+            raw = str(self.session.headers.get("cookie") or "")
+            if raw:
+                kept = []
+                for part in raw.split(";"):
+                    piece = part.strip()
+                    if not piece:
+                        continue
+                    name = piece.split("=", 1)[0].strip().lower()
+                    if name in _AUTH_SSO_COOKIE_NAMES:
+                        continue
+                    kept.append(piece)
+                if kept:
+                    self.session.headers["cookie"] = "; ".join(kept)
+                else:
+                    self.session.headers.pop("cookie", None)
+
     def apply_clearance(self) -> dict[str, Any]:
         """Load clearance cache into the session cookie jar + sticky Cookie hdr."""
         with self._lock:
+            # Never let a prior account's SSO ride along with fresh clearance.
+            _purge_auth_cookies(self.session)
             bundle = clearance_bundle()
             for cookie in bundle.get("cookies") or []:
                 name = str(cookie.get("name") or "").strip()
                 if not name:
+                    continue
+                # Clearance dumps must not re-inject account session cookies.
+                if name.lower() in _AUTH_SSO_COOKIE_NAMES:
                     continue
                 value = str(cookie.get("value") or "")
                 domain = str(cookie.get("domain") or "").strip() or ".x.ai"
@@ -333,7 +365,37 @@ class XAIHttpClient:
                 or ""
             )
             if cookie_hdr:
-                self.session.headers["cookie"] = cookie_hdr
+                # Strip any SSO that slipped into the clearance header cache.
+                kept = []
+                for part in str(cookie_hdr).split(";"):
+                    piece = part.strip()
+                    if not piece:
+                        continue
+                    name = piece.split("=", 1)[0].strip().lower()
+                    if name in _AUTH_SSO_COOKIE_NAMES:
+                        continue
+                    kept.append(piece)
+                if kept:
+                    self.session.headers["cookie"] = "; ".join(kept)
+                else:
+                    self.session.headers.pop("cookie", None)
+            else:
+                # Ensure sticky header does not retain SSO from a prior slot use.
+                raw = str(self.session.headers.get("cookie") or "")
+                if raw:
+                    kept = []
+                    for part in raw.split(";"):
+                        piece = part.strip()
+                        if not piece:
+                            continue
+                        name = piece.split("=", 1)[0].strip().lower()
+                        if name in _AUTH_SSO_COOKIE_NAMES:
+                            continue
+                        kept.append(piece)
+                    if kept:
+                        self.session.headers["cookie"] = "; ".join(kept)
+                    else:
+                        self.session.headers.pop("cookie", None)
             return bundle
 
     def refresh_clearance(self, *, force: bool = True) -> dict[str, Any]:
@@ -628,6 +690,8 @@ class XAIHttpClient:
 
         Optional CreateSession password fallback when RSC has no sso chain.
         """
+        # Isolate this email from any previous pool-slot account.
+        self.clear_auth_cookies()
         given_name = given_name or random.choice(
             ["James", "John", "Robert", "Michael", "William", "David"]
         )
@@ -635,7 +699,7 @@ class XAIHttpClient:
             ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia"]
         )
         conv = (conversion_id or str(uuid.uuid4())).strip()
-        # Server Action create-account payload shape (field order matters).
+        # Match lite xconsole_client.create_account args exactly.
         payload_obj = [
             {
                 "emailValidationCode": code,
@@ -728,10 +792,12 @@ class XAIHttpClient:
                     set_url = hop
                     sso_source = "set_cookie"
                     break
+        # Safe only because clear_auth_cookies() ran at entry: any jar sso is
+        # from this request's Set-Cookie, not a previous pool-slot account.
         if not sso:
             sso = _session_cookie_value(self.session, "sso")
             if sso:
-                sso_source = "jar"
+                sso_source = "session"
         if not sso:
             sso = _sso_from_text(text)
             if sso:
@@ -789,6 +855,8 @@ class XAIHttpClient:
         retry_on_cf: bool = True,
     ) -> SignupResult:
         """AuthManagement/CreateSession → session JWT usable as sso cookie value."""
+        # Do not inherit another account's sso from a reused pool Session.
+        self.clear_auth_cookies()
         body = connect_frame(
             encode_create_session_request(
                 email,
@@ -842,12 +910,18 @@ class XAIHttpClient:
             if m:
                 grpc_status = m.group(1)
 
-        sso = direct or _session_cookie_value(self.session, "sso")
+        # Prefer response headers / body. Jar is only trusted when this call
+        # just cleared auth cookies and the response itself set sso (same
+        # request side-effect) — still require a successful grpc status.
+        sso = direct
         if not sso and raw:
             # Session JWT often lands as a printable string field in the protobuf.
             sso = _sso_jwt_from_bytes(raw)
         if not sso:
             sso = _sso_from_text(text)
+        if not sso and status == 200 and not cf and str(grpc_status) in {"0", ""}:
+            # Same-request Set-Cookie may land only in the jar.
+            sso = _session_cookie_value(self.session, "sso")
 
         ok = bool(sso) and status == 200 and not cf and str(grpc_status) in {"0", ""}
         err = ""
@@ -856,13 +930,13 @@ class XAIHttpClient:
         return SignupResult(
             ok=ok,
             http_status=status,
-            sso=sso,
+            sso=sso if ok else None,
             body_preview=(text or "")[:300].replace("\n", " "),
             markers=f"grpc={grpc_status}",
             cf_blocked=cf,
             elapsed_ms=int((time.time() - t0) * 1000),
             error=err,
-            sso_source="create_session" if sso else "",
+            sso_source="create_session" if ok else "",
         )
 
     def follow_set_cookie(self, url: str) -> str | None:
@@ -1052,11 +1126,21 @@ class XAIHttpClientPool:
         except Exception:
             # Still return the slot — caller may retry / refresh.
             pass
+        try:
+            # Belt-and-suspenders: never hand a slot out with foreign SSO.
+            client.clear_auth_cookies()
+        except Exception:
+            pass
         return client
 
     def release(self, client: XAIHttpClient) -> None:
         if client is None or self._closed:
             return
+        try:
+            # Drop account cookies before the next email reuses this Session.
+            client.clear_auth_cookies()
+        except Exception:
+            pass
         try:
             self._q.put_nowait(client)
         except queue.Full:
@@ -1324,6 +1408,140 @@ def _sso_from_response(resp) -> str | None:
     except Exception:
         pass
     return None
+
+
+_AUTH_SSO_COOKIE_NAMES = frozenset({"sso", "sso-rw"})
+
+
+def _purge_auth_cookies(session) -> None:
+    """Remove sso / sso-rw from a curl_cffi (or requests-like) cookie jar."""
+    if session is None:
+        return
+    names = _AUTH_SSO_COOKIE_NAMES
+    # Fast path: dict-like delete
+    for name in names:
+        try:
+            del session.cookies[name]
+        except Exception:
+            pass
+        try:
+            session.cookies.set(name, "", domain=".x.ai", path="/")
+        except Exception:
+            pass
+        try:
+            session.cookies.set(name, "", domain="accounts.x.ai", path="/")
+        except Exception:
+            pass
+        try:
+            session.cookies.set(name, "", domain=".grok.com", path="/")
+        except Exception:
+            pass
+    # Walk jar and clear matching Cookie objects (domain-scoped leftovers).
+    try:
+        jar = getattr(session.cookies, "jar", None) or session.cookies
+        victims = [
+            c
+            for c in list(jar)
+            if str(getattr(c, "name", "") or "").lower() in names
+        ]
+        for c in victims:
+            domain = getattr(c, "domain", None) or ""
+            path = getattr(c, "path", None) or "/"
+            cname = getattr(c, "name", "") or ""
+            try:
+                jar.clear(domain, path, cname)
+            except Exception:
+                try:
+                    # Some jars expose set_cookie / extract; last resort overwrite.
+                    session.cookies.set(cname, "", domain=domain or None, path=path)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Name-only iteration fallback (curl_cffi sometimes yields bare names).
+    try:
+        for cookie in list(session.cookies):
+            cname = getattr(cookie, "name", None)
+            if cname is None and isinstance(cookie, str):
+                cname = cookie
+            if str(cname or "").lower() not in names:
+                continue
+            try:
+                del session.cookies[cname]
+            except Exception:
+                try:
+                    session.cookies.set(cname, "")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+_AUTH_SSO_COOKIE_NAMES = frozenset({"sso", "sso-rw"})
+
+
+def _purge_auth_cookies(session) -> None:
+    """Remove sso / sso-rw from a curl_cffi (or requests-like) cookie jar."""
+    if session is None:
+        return
+    names = _AUTH_SSO_COOKIE_NAMES
+    # Fast path: dict-like delete
+    for name in names:
+        try:
+            del session.cookies[name]
+        except Exception:
+            pass
+        try:
+            session.cookies.set(name, "", domain=".x.ai", path="/")
+        except Exception:
+            pass
+        try:
+            session.cookies.set(name, "", domain="accounts.x.ai", path="/")
+        except Exception:
+            pass
+        try:
+            session.cookies.set(name, "", domain=".grok.com", path="/")
+        except Exception:
+            pass
+    # Walk jar and clear matching Cookie objects (domain-scoped leftovers).
+    try:
+        jar = getattr(session.cookies, "jar", None) or session.cookies
+        victims = [
+            c
+            for c in list(jar)
+            if str(getattr(c, "name", "") or "").lower() in names
+        ]
+        for c in victims:
+            domain = getattr(c, "domain", None) or ""
+            path = getattr(c, "path", None) or "/"
+            cname = getattr(c, "name", "") or ""
+            try:
+                jar.clear(domain, path, cname)
+            except Exception:
+                try:
+                    # Some jars expose set_cookie / extract; last resort overwrite.
+                    session.cookies.set(cname, "", domain=domain or None, path=path)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Name-only iteration fallback (curl_cffi sometimes yields bare names).
+    try:
+        for cookie in list(session.cookies):
+            cname = getattr(cookie, "name", None)
+            if cname is None and isinstance(cookie, str):
+                cname = cookie
+            if str(cname or "").lower() not in names:
+                continue
+            try:
+                del session.cookies[cname]
+            except Exception:
+                try:
+                    session.cookies.set(cname, "")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def _session_cookie_value(session, name: str) -> str | None:

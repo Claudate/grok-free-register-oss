@@ -45,7 +45,7 @@ def main() -> int:
     if args.proxy:
         os.environ["REGISTER_PROXY"] = args.proxy
 
-    # Defaults for a local clearance stack if operator forgot .env
+    # Defaults for a local chatgpt2api / clearance stack if operator forgot .env
     os.environ.setdefault("CLEARANCE_ENABLED", "1")
     os.environ.setdefault("FLARESOLVERR_URL", "http://127.0.0.1:8191")
     os.environ.setdefault(

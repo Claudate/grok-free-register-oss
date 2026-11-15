@@ -20,6 +20,18 @@ from xai_enroller.ledger import Ledger
 from xai_enroller.inventory import InventoryError
 
 
+def test_service_lock_is_exclusive(tmp_path):
+    from xai_enroller.service import (
+        AuthServiceAlreadyRunningError,
+        acquire_service_lock,
+    )
+
+    first = acquire_service_lock(tmp_path)
+    with pytest.raises(AuthServiceAlreadyRunningError):
+        acquire_service_lock(tmp_path)
+    first.close()
+
+
 def test_auth_log_mode_prefers_cli_and_rejects_invalid_values():
     assert resolve_auth_log_mode([], {}) == "user"
     assert resolve_auth_log_mode(
@@ -80,10 +92,67 @@ def test_user_terminal_reports_progress_without_internal_or_secret_fields():
         "[→] 开始认证 #3 | 待处理 41",
         "[✓] 认证成功 #3 | 运行平均 1.75/分 | 累计 120 | 可用 117",
     ]
-    rendered = "\n".join(messages)
-    assert "source_queue" not in rendered
-    assert "secret@example.test" not in rendered
-    assert "do-not-print.example" not in rendered
+
+
+def test_user_terminal_shows_resume_progress_on_startup_and_service_started():
+    messages = []
+    terminal = EventTerminal(mode="user", output=messages.append)
+    terminal.emit(
+        (
+            "startup",
+            {
+                "available": 700,
+                "claimed": 32,
+                "destination": "authenticated/",
+                "source_kind": "local",
+                "imported_unique": 732,
+                "pending_total": 463,
+                "authorization_concurrency": 2,
+            },
+        )
+    )
+    terminal.emit(
+        (
+            "service_started",
+            {
+                "authorization_concurrency": 2,
+                "executor": "playwright",
+                "imported_unique": 732,
+                "pending_total": 463,
+                "authorization_starts": 885,
+                "min_authorization_interval_seconds": 0.0,
+            },
+        )
+    )
+    terminal.emit(
+        (
+            "pipeline_error",
+            {
+                "stage": "authorization_task",
+                "reason": "internal_error",
+                "error_type": "RuntimeError",
+                "fatal": False,
+            },
+        )
+    )
+    terminal.emit(
+        (
+            "pipeline_error",
+            {"stage": "source", "reason": "internal_error", "fatal": True},
+        )
+    )
+
+    assert messages[0] == (
+        "[✓] 本地认证服务已启动 | 来源 本机 | 输出 authenticated/ | "
+        "已导入 732 | 待处理 463 | 可用 700 | 并发 2"
+    )
+    assert messages[1] == (
+        "[▶] 认证流水线运行中 | 并发 2 | 浏览器 | 续跑已导入 732 | "
+        "待处理 463 | 任务号续自 #885"
+    )
+    assert "已隔离，继续跑" in messages[2]
+    assert "authorization_task" in messages[2]
+    assert messages[3] == "[!] 认证流水线异常 | 阶段 source"
 
 
 def test_user_status_distinguishes_unknown_runtime_rate_from_zero_rate():
@@ -287,10 +356,23 @@ def test_auth_service_settings_defaults_local_and_preserves_ssh_auto_detection(t
     assert local.source_kind == "local"
     assert local.ssh_host is None
     assert local.register_root == str(tmp_path)
+    assert local.authorization_concurrency == 2
     assert remote.source_kind == "ssh"
     assert remote.ssh_host == "ubuntu@example.test"
     assert remote.sync_seconds == 45
     assert remote.remote_root == "/opt/grok-free-register"
+    assert remote.authorization_concurrency == 2
+
+
+def test_auth_service_settings_concurrency_clamped_to_1_through_3():
+    ok = AuthServiceSettings.from_environ({"XAI_AUTH_SERVICE_CONCURRENCY": "3"})
+    assert ok.authorization_concurrency == 3
+    via_enroller = AuthServiceSettings.from_environ({"XAI_ENROLLER_CONCURRENCY": "1"})
+    assert via_enroller.authorization_concurrency == 1
+    with pytest.raises(ValueError, match="XAI_AUTH_SERVICE_CONCURRENCY"):
+        AuthServiceSettings.from_environ({"XAI_AUTH_SERVICE_CONCURRENCY": "4"})
+    with pytest.raises(ValueError, match="XAI_AUTH_SERVICE_CONCURRENCY"):
+        AuthServiceSettings.from_environ({"XAI_AUTH_SERVICE_CONCURRENCY": "0"})
 
 
 def test_auth_service_settings_explicit_source_overrides_auto_detection():
